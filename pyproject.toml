@@ -9,7 +9,11 @@ description = "HIOB polyrepo planet · hiob-platform"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
-dependencies = []
+dependencies = [
+    "httpx",
+    "pydantic",
+    "supabase",
+]
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0"]
