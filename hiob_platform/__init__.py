@@ -1,4 +1,5 @@
 """Hiob agent-native video platform SDK."""
+from hiob_platform.agent_outputs import _latest_art_director_output
 from hiob_platform.client import get_service_client
 from hiob_platform.runs import (
     APPROVED_SCRIPT_STATUSES,
@@ -27,6 +28,8 @@ from hiob_platform.role_artifacts import (
     materialize_role_outputs,
 )
 from hiob_platform.placement import place_library_video, place_social_proof
+from hiob_platform.schemas import ProductionJobStatusUpdate, validate_production_job_update
+from hiob_platform.render_gate import RenderReadiness, check_run_render_ready
 from hiob_platform.storage import (
     public_url,
     register_asset_library_item,
@@ -57,6 +60,7 @@ from hiob_platform.team import (
 )
 
 __all__ = [
+    "_latest_art_director_output",
     "get_service_client",
     "APPROVED_SCRIPT_STATUSES",
     "assert_run_script_gate",
@@ -84,6 +88,8 @@ __all__ = [
     "notify_run_started",
     "notify_run_done",
     "notify_regen",
+    "ProductionJobStatusUpdate",
+    "validate_production_job_update",
     "DEFAULT_TEAM_ROLES",
     "create_team",
     "update_team",
@@ -106,4 +112,4 @@ __all__ = [
     "expected_artifacts_from_team_leader",
     "diff_expected_vs_actual",
 ]
-__version__ = "0.1.0"
+__version__ = "0.2.0"

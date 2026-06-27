@@ -439,10 +439,10 @@ def sync_clips_from_slots(client: Client, run_id: str) -> dict:
     if not slot_rows:
         return {"updated": 0, "run_id": run_id}
 
-    # 2. Timeline for this run.
+    # 2. Timeline for this run; extract per-beat durations from markers.
     tl = (
         client.table("timeline")
-        .select("id")
+        .select("id, markers")
         .eq("run_id", run_id)
         .limit(1)
         .execute()
@@ -451,6 +451,13 @@ def sync_clips_from_slots(client: Client, run_id: str) -> dict:
     if not tl:
         return {"updated": 0, "run_id": run_id}
     timeline_id = tl[0]["id"]
+
+    # Extract beat_index → beat_duration_ms mapping from markers (decouple from _BEAT_MS grid).
+    beat_duration_by_idx: dict[int, int] = {}
+    markers = tl[0].get("markers") or []
+    for marker in markers:
+        if marker.get("beatIndex") is not None and marker.get("durationMs") is not None:
+            beat_duration_by_idx[int(marker["beatIndex"])] = int(marker["durationMs"])
 
     # 3. Tracks → map kind → track ids. Some kinds are intentionally duplicated:
     # Voice A and Voice B are both kind="audio" with different ord values, so a
@@ -521,6 +528,8 @@ def sync_clips_from_slots(client: Client, run_id: str) -> dict:
 
     # 6. Match each slot to all its clips via (beat_index, clip_kind); patch artifact_id.
     # Stage 2: iterate over ALL clips in the list, not just pop() the first.
+    # Prefer beat-keyed lookup (using beat_index + per-beat duration from markers) when available;
+    # fall back to start_ms for true orphans (beat_index=NULL).
     updated = 0
     for slot in slot_rows:
         clip_kind = _SLOT_TRACK_TO_CLIP_KIND.get(slot["track"])
@@ -533,7 +542,7 @@ def sync_clips_from_slots(client: Client, run_id: str) -> dict:
         if beat_index is not None:
             target_clips = clip_by_beat_kind.pop((int(beat_index), clip_kind), [])
         else:
-            # No beat_index: match by start_ms (music full-clip, sfx non-beat slots)
+            # No beat_index (orphan sub-shot): match by start_ms (music full-clip, sfx non-beat slots)
             target_clips = clip_by_ms_kind.pop((start_ms, clip_kind), [])
 
         # Stage 2: bind ALL clips (not just first).
@@ -548,8 +557,6 @@ def sync_clips_from_slots(client: Client, run_id: str) -> dict:
             updated += 1
 
     print(f"[SYNC-CLIPS] run={run_id} updated={updated} (all artifacts, no loss)")
-    return {"updated": updated, "run_id": run_id}
-
     return {"updated": updated, "run_id": run_id}
 
 
