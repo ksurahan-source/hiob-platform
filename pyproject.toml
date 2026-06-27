@@ -1,25 +1,24 @@
 [build-system]
-requires = ["setuptools>=45", "wheel"]
+requires = ["setuptools>=68", "wheel", "build"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "hiob-platform"
 version = "0.1.0"
-description = "HIOB polyrepo planet · hiob-platform"
+description = "Hiob agent-native video platform SDK (Python)"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = {text = "MIT"}
 dependencies = [
-    "httpx",
-    "pydantic",
-    "supabase",
+    "supabase>=2.18",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0"]
 
-[tool.setuptools]
-packages = ["hiob_platform"]
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["hiob_platform*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
