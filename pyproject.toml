@@ -1,24 +1,17 @@
-[build-system]
-requires = ["setuptools>=68", "wheel", "build"]
-build-backend = "setuptools.build_meta"
-
 [project]
 name = "hiob-platform"
 version = "0.1.0"
-description = "Hiob agent-native video platform SDK (Python)"
-readme = "README.md"
+description = "Hiob agent-native video platform SDK (Python) — auth·DB client·spans (폴리레포 substrate)."
 requires-python = ">=3.11"
-license = {text = "MIT"}
 dependencies = [
-    "supabase>=2.18",
+  "supabase>=2.18",
+  "httpx",
+  "pydantic",
 ]
 
-[project.optional-dependencies]
-dev = ["pytest>=7.0"]
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["hiob_platform*"]
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
+[tool.hatch.build.targets.wheel]
+packages = ["hiob_platform"]
