@@ -586,7 +586,9 @@ _VOICE_OVERLAP_MS = max(0, int(os.environ.get("VOICE_OVERLAP_MS", "250")))
 # NAPKIN "THE SCENE": every scene image must hold UNINTERRUPTED >= 0.8s (no sub-second
 # flicker). This floors the ON-SCREEN image/caption window; audio still plays in full and
 # may overflow the image cut (audio lanes are independent of image cuts).
-_MIN_SCENE_MS = max(0, int(os.environ.get("MIN_SCENE_MS", "800")))
+# D-43 (founder 2026-07-02): 800ms 바닥이 0.8초 컷 지옥의 공범 — 문장 단위(2~3.5s) 리듬을
+# 위해 기본 1800ms. 구 동작은 env MIN_SCENE_MS=800.
+_MIN_SCENE_MS = max(0, int(os.environ.get("MIN_SCENE_MS", "1800")))
 
 
 # EDIT-WIRE-3: extra silence per scene type so comedy/product beats breathe.
