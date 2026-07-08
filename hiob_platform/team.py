@@ -958,7 +958,7 @@ def repack_timeline_to_audio(client: Client, run_id: str) -> dict:
     }
 
 
-_SUBBEAT_MAX_MS = 3000  # mirror of athena SUBBEAT_MAX_MS (founder 3초/장 규범 2026-07-08)
+_SUBBEAT_MAX_MS = 3500  # mirror of athena SUBBEAT_MAX_MS (founder 3초/장 규범 2026-07-08)
 _SUBBEAT_MAX_COUNT = 2  # cap sub-beat count to limit API spend
 
 
