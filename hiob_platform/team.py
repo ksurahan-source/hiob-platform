@@ -958,8 +958,8 @@ def repack_timeline_to_audio(client: Client, run_id: str) -> dict:
     }
 
 
-_SUBBEAT_MAX_MS = 800  # mirror of visual.py SUBBEAT_MAX_MS
-_SUBBEAT_MAX_COUNT = 4  # cap sub-beat count to limit API spend
+_SUBBEAT_MAX_MS = 3000  # mirror of athena SUBBEAT_MAX_MS (founder 3초/장 규범 2026-07-08)
+_SUBBEAT_MAX_COUNT = 2  # cap sub-beat count to limit API spend
 
 
 def sync_video_positions_from_markers(client: Client, run_id: str) -> dict:
