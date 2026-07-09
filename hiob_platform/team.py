@@ -1067,6 +1067,48 @@ def sync_video_positions_from_markers(client: Client, run_id: str) -> dict:
     return {"synced": synced, "total": len(video_clips)}
 
 
+def extend_music_to_cover(client: Client, run_id: str) -> dict:
+    """음악 트랙이 영상 끝보다 짧으면 같은 애셋을 루프(연속 클론)로 채운다.
+
+    2026-07-10 실사고: 음악 애셋(32.0s)이 패딩 비트 체인(38.7s)보다 짧아 마지막
+    6.7초가 무음악 — 렌더 게이트 G3가 차단한 실결함. 마지막 조각은 남는 길이로
+    클램프. Idempotent(이미 커버돼 있으면 no-op). 클론엔 attributes.looped 표기.
+    """
+    tl = client.table("timeline").select("id").eq("run_id", run_id).limit(1).execute().data
+    if not tl:
+        return {"looped": 0, "skipped": "no_timeline"}
+    timeline_id = tl[0]["id"]
+    tracks = (client.table("timeline_track").select("id, kind")
+              .eq("timeline_id", timeline_id).execute().data or [])
+    video_ids = [t["id"] for t in tracks if t["kind"] == "video"]
+    music_ids = [t["id"] for t in tracks if t["kind"] == "music"]
+    if not video_ids or not music_ids:
+        return {"looped": 0, "skipped": "no_tracks"}
+    v_clips = (client.table("clip").select("start_ms, duration_ms")
+               .in_("track_id", video_ids).execute().data or [])
+    video_end = max((int(c["start_ms"] or 0) + int(c["duration_ms"] or 0) for c in v_clips), default=0)
+    m_clips = (client.table("clip").select("id, track_id, artifact_id, start_ms, duration_ms, transforms, effects")
+               .in_("track_id", music_ids).order("start_ms").execute().data or [])
+    if not m_clips or not video_end:
+        return {"looped": 0, "skipped": "no_music_or_video"}
+    last = m_clips[-1]
+    music_end = int(last["start_ms"] or 0) + int(last["duration_ms"] or 0)
+    unit = max(1000, int(last["duration_ms"] or 0))
+    looped = 0
+    while video_end - music_end > 500 and looped < 8:
+        dur = min(unit, video_end - music_end)
+        client.table("clip").insert({
+            "track_id": last["track_id"], "artifact_id": last["artifact_id"],
+            "start_ms": music_end, "duration_ms": dur, "in_ms": 0, "beat_index": None,
+            "transforms": last.get("transforms") or {"x": 0, "y": 0, "scale": 1, "rotation": 0, "opacity": 1},
+            "effects": last.get("effects") or [],
+            "attributes": {"looped": True, "loop_of": last["id"]},
+        }).execute()
+        music_end += dur
+        looped += 1
+    return {"looped": looped, "video_end": video_end, "music_end": music_end}
+
+
 def sync_audio_positions_from_markers(client: Client, run_id: str) -> dict:
     """보이스(audio)·SFX 클립을 caption/video와 같은 가변 비트 마커에 정렬.
 
