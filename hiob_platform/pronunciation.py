@@ -10,7 +10,16 @@ ASCII_TOKEN_RE = re.compile(r"\b[A-Za-z][A-Za-z0-9_-]*\b")
 _TERM_REPLACEMENTS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\bhi[-\s]?ob\b", re.IGNORECASE), "히옵"),
     (re.compile(r"\breels\b", re.IGNORECASE), "릴스"),
+    # 규격/기관 약어 — 폐쇄 화이트리스트 (2026-07-09 founder: TTS가 'OECD 405'를 '포헌드레드파이브'로 영어 독음)
+    (re.compile(r"\bOECD\b"), "오이시디"),
+    (re.compile(r"\bISO\b"), "아이에스오"),
+    (re.compile(r"\bIEC\b"), "아이이씨"),
+    (re.compile(r"\bKC\b"), "케이씨"),
 )
+
+# 규격 코드 숫자 독음: 약어(한글 치환 후) 뒤의 맨숫자는 한자어로 ("오이시디 405"→"오이시디 사백오").
+# 단위 규칙(_SINO_UNIT_RE)이 못 잡는 '단위 없는 규격 번호' 전용 — 일반 맨숫자는 건드리지 않는다.
+_STANDARD_CODE_RE = re.compile(r"(오이시디|아이에스오|아이이씨|케이씨)\s*(\d{2,5})\b")
 
 
 def has_ascii_alpha(text: str) -> bool:
@@ -70,6 +79,7 @@ def normalize_korean_pronunciation(text: str, overrides: Any = None) -> str:
     out = tts_numeral_reading(out)          # 숫자+단위 → 올바른 독음("10초"→"십초") — TTS 전용 진입점
     for pattern, replacement in _TERM_REPLACEMENTS:
         out = pattern.sub(replacement, out)
+    out = _STANDARD_CODE_RE.sub(lambda m: f"{m.group(1)} {sino_reading(int(m.group(2)))}", out)
     out = re.sub(r"\bCTA\b", "지금 문의" if "문의" in out else "지금 신청", out, flags=re.IGNORECASE)
     return _apply_overrides(out, overrides)
 
