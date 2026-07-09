@@ -1067,6 +1067,59 @@ def sync_video_positions_from_markers(client: Client, run_id: str) -> dict:
     return {"synced": synced, "total": len(video_clips)}
 
 
+def sync_audio_positions_from_markers(client: Client, run_id: str) -> dict:
+    """보이스(audio)·SFX 클립을 caption/video와 같은 가변 비트 마커에 정렬.
+
+    2026-07-10 desync 실사고: patch_beat_markers_from_tts(보이스 실길이+300ms 숨)가
+    caption·video만 재배치하고 audio는 조립 체인(실길이 연쇄)에 남겨, 매 비트
+    +300~470ms 드리프트가 16비트에 6.7초 누적 — "말은 먼저 끝나고 자막·이미지가
+    따로"의 근본. 세 트랙이 단일 시간 체계(마커)를 공유해야 한다. Idempotent.
+    보이스 duration은 artifact 실길이를 유지(마커 창 초과 시에만 창으로 클램프) —
+    비트 끝 300ms는 설계된 숨이 된다.
+    """
+    tl = client.table("timeline").select("id, markers").eq("run_id", run_id).limit(1).execute().data
+    if not tl:
+        return {"synced": 0, "skipped": "no_timeline"}
+    timeline = tl[0]
+    markers = [m for m in (timeline.get("markers") or [])
+               if m.get("beatIndex") is not None and m.get("durationMs") is not None]
+    if not markers:
+        return {"synced": 0, "skipped": "no_markers"}
+    sorted_m = sorted(markers, key=lambda m: m.get("beatIndex") or 0)
+    beat_start: dict[int, int] = {}
+    beat_window: dict[int, int] = {}
+    for idx, m in enumerate(sorted_m):
+        bi = int(m["beatIndex"])
+        t0 = int(m.get("timeMs") or 0)
+        t1 = int(sorted_m[idx + 1].get("timeMs") or 0) if idx + 1 < len(sorted_m) else t0 + int(m["durationMs"])
+        beat_start[bi] = t0
+        beat_window[bi] = max(50, t1 - t0)
+
+    tracks = (client.table("timeline_track").select("id, kind")
+              .eq("timeline_id", timeline["id"]).in_("kind", ["audio", "sfx"]).execute().data or [])
+    if not tracks:
+        return {"synced": 0, "skipped": "no_audio_tracks"}
+    synced = 0
+    for t in tracks:
+        clips = (client.table("clip").select("id, beat_index, start_ms, duration_ms")
+                 .eq("track_id", t["id"]).not_.is_("beat_index", "null").execute().data or [])
+        for clip in clips:
+            bi = int(clip["beat_index"])
+            if bi not in beat_start:
+                continue
+            new_start = beat_start[bi]
+            dur = int(clip.get("duration_ms") or 0)
+            # 보이스/SFX 실길이 유지 — 창 초과 시에만 클램프(다음 비트 침범 방지)
+            new_dur = min(dur, beat_window[bi]) if dur > 0 else beat_window[bi]
+            if int(clip.get("start_ms") or 0) == new_start and dur == new_dur:
+                continue
+            client.table("clip").update({
+                "start_ms": new_start, "duration_ms": new_dur, "updated_at": "now()",
+            }).eq("id", clip["id"]).execute()
+            synced += 1
+    return {"synced": synced}
+
+
 def sync_caption_positions_from_markers(client: Client, run_id: str) -> dict:
     """Align caption clip start_ms/duration_ms to variable beat markers.
 

@@ -51,6 +51,7 @@ from hiob_platform.team import (
     repack_timeline_to_audio,
     split_long_beats_into_subshots,
     sync_caption_positions_from_markers,
+    sync_audio_positions_from_markers,
     sync_video_positions_from_markers,
     start_call,
     sync_clips_from_slots,
