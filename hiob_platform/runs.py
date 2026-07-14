@@ -100,18 +100,110 @@ def create_production_job(
     return res.data[0]
 
 
+def render_job_patch_after_compose(
+    result: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Build render_jobs update after compose_and_render_v2.
+
+    Terminal ``done`` is allowed only when a non-empty playable URL is present.
+    Dispatch-only compose results stay ``processing`` (WS06 bridge fills URL later).
+    """
+    result = result or {}
+    output_url = result.get("output_url") or result.get("mp4_url")
+    url = str(output_url or "").strip()
+    duration_s = result.get("duration_s")
+    if url:
+        patch: dict[str, Any] = {
+            "status": "done",
+            "output_url": url,
+            "completed_at": "now()",
+        }
+        if duration_s is not None:
+            patch["duration_s"] = duration_s
+        return patch
+    patch = {
+        "status": "processing",
+        "output_url": None,
+        "metadata": {
+            "awaiting_output_url": True,
+            "snapshot_id": result.get("snapshot_id"),
+            "render_dispatched": result.get("render_dispatched"),
+        },
+    }
+    if duration_s is not None:
+        patch["duration_s"] = duration_s
+    return patch
+
+
+def is_visual_worker_success(out: Any) -> bool:
+    """Hard predicate for visual_run soft-error dicts.
+
+    Workers that return ``{"error": "...", "visuals": 0}`` without raising used to
+    mark production_jobs succeeded and green the run. That is forbidden.
+    """
+    if not isinstance(out, dict):
+        return True
+    if out.get("error"):
+        return False
+    if "visuals" in out:
+        try:
+            if int(out.get("visuals") or 0) <= 0:
+                return False
+        except (TypeError, ValueError):
+            return False
+    return True
+
+
+def media_job_row_is_clean_success(row: dict[str, Any] | None) -> bool:
+    """Latest media job row must be status=succeeded without error attrs."""
+    if not row:
+        return False
+    if str(row.get("status") or "") != "succeeded":
+        return False
+    attrs = row.get("attributes") if isinstance(row.get("attributes"), dict) else {}
+    if attrs.get("error"):
+        return False
+    kind = str(row.get("kind") or "")
+    if kind == "visual" and not is_visual_worker_success(attrs):
+        return False
+    return True
+
+
+def mark_preview_produced(client: Client, run_id: str) -> dict:
+    """Mark script_status=produced for editor/preview readiness only.
+
+    Does **not** set run.status=succeeded (customer-done requires playable URL).
+    """
+    return set_run_script_status(client, run_id, "produced")
+
+
+def mark_run_media_failed(client: Client, run_id: str, *, reason: str) -> dict:
+    """Fail-loud terminal when required media jobs die — never stuck queued forever."""
+    payload: dict[str, Any] = {
+        "status": "failed",
+        "script_status": "failed",
+        "ended_at": "now()",
+        "attributes": {
+            "produce_error": str(reason)[:500],
+            "fail_loud": True,
+            "fail_stage": "media_jobs",
+        },
+    }
+    res = client.table("run").update(payload).eq("id", run_id).execute()
+    return res.data[0] if res.data else {}
+
+
 def maybe_mark_run_produced(client: Client, run_id: str) -> dict:
-    """Mark a run produced when all approval-created media jobs finish.
+    """Mark a run produced when all approval-created media jobs finish cleanly.
 
     The derive job only queues parallel media work. Render must wait until the
-    visual/voiceover/music/sfx jobs have each reached a terminal non-failed
-    state, otherwise the user can render placeholder clips. caption/title_style
-    jobs are also respected when present, while older in-flight runs that only
-    created the four media jobs can still finish.
+    visual/voiceover/music/sfx jobs have each reached a clean succeeded state.
+    Soft-error attributes or zero visuals block produce. Any failed required job
+    marks the run failed (fail-loud — no eternal queued/producing).
     """
     rows = (
         client.table("production_jobs")
-        .select("id, kind, status, queued_at, created_at")
+        .select("id, kind, status, attributes, queued_at, created_at")
         .eq("run_id", run_id)
         .in_("kind", list(PRODUCTION_WORK_KINDS))
         .order("queued_at", desc=True)
@@ -122,23 +214,38 @@ def maybe_mark_run_produced(client: Client, run_id: str) -> dict:
     )
     if not rows:
         return {}
-    by_kind: dict[str, str | None] = {}
+    by_kind: dict[str, dict[str, Any]] = {}
     for row in rows:
         kind = row.get("kind")
         if kind in PRODUCTION_WORK_KINDS and kind not in by_kind:
-            by_kind[kind] = row.get("status")
+            by_kind[kind] = row
     if not REQUIRED_PRODUCTION_WORK_KINDS.issubset(by_kind):
         return {}
     relevant = {
-        kind: status
-        for kind, status in by_kind.items()
+        kind: row
+        for kind, row in by_kind.items()
         if kind in REQUIRED_PRODUCTION_WORK_KINDS or kind in OPTIONAL_PRODUCTION_WORK_KINDS
     }
-    if any(status in {"queued", "running"} for status in relevant.values()):
+    statuses = {kind: str(row.get("status") or "") for kind, row in relevant.items()}
+    if any(st in {"queued", "running"} for st in statuses.values()):
         return {}
-    if any(status == "failed" for status in relevant.values()):
-        return {}
-    return set_run_script_status(client, run_id, "produced")
+    # Fail-loud: required kind failed → terminal fail (never leave producing forever).
+    failed_required = [
+        kind
+        for kind in REQUIRED_PRODUCTION_WORK_KINDS
+        if statuses.get(kind) == "failed"
+    ]
+    if failed_required:
+        return mark_run_media_failed(
+            client,
+            run_id,
+            reason=f"required media jobs failed: {','.join(sorted(failed_required))}",
+        )
+    # Required kinds must be clean succeeded (not skipped/cancelled/soft).
+    for kind in REQUIRED_PRODUCTION_WORK_KINDS:
+        if not media_job_row_is_clean_success(relevant.get(kind)):
+            return {}
+    return mark_preview_produced(client, run_id)
 
 
 def end_run(client: Client, run_id: str, status: str = "succeeded", **fields: Any) -> dict:
