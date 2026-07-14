@@ -154,6 +154,34 @@ def is_visual_worker_success(out: Any) -> bool:
     return True
 
 
+def media_worker_result_is_success(out: Any, *, kind: str = "") -> bool:
+    """Predicate for media worker return dicts (voice/music/sfx/visual).
+
+    Soft-fail shapes that must NOT mark production_jobs succeeded:
+    - ``{"error": ...}``
+    - ``{"skipped": ...}`` (empty music pool etc.)
+    - ``{"failed": [...], "created": 0}`` total SFX/visual batch miss
+    - visual-specific: zero visuals / error (via is_visual_worker_success)
+    """
+    if not isinstance(out, dict):
+        return True
+    if out.get("error"):
+        return False
+    if out.get("skipped"):
+        return False
+    failed = out.get("failed")
+    if isinstance(failed, list) and len(failed) > 0:
+        try:
+            created = int(out.get("created") or 0)
+        except (TypeError, ValueError):
+            created = 0
+        if created <= 0:
+            return False
+    if kind == "visual" or "visuals" in out:
+        return is_visual_worker_success(out)
+    return True
+
+
 def media_job_row_is_clean_success(row: dict[str, Any] | None) -> bool:
     """Latest media job row must be status=succeeded without error attrs."""
     if not row:
@@ -163,8 +191,10 @@ def media_job_row_is_clean_success(row: dict[str, Any] | None) -> bool:
     attrs = row.get("attributes") if isinstance(row.get("attributes"), dict) else {}
     if attrs.get("error"):
         return False
+    if attrs.get("skipped"):
+        return False
     kind = str(row.get("kind") or "")
-    if kind == "visual" and not is_visual_worker_success(attrs):
+    if not media_worker_result_is_success(attrs, kind=kind):
         return False
     return True
 

@@ -17,6 +17,7 @@ from hiob_platform.runs import (  # noqa: E402
     is_visual_worker_success,
     mark_preview_produced,
     media_job_row_is_clean_success,
+    media_worker_result_is_success,
     maybe_mark_run_produced,
     render_job_patch_after_compose,
 )
@@ -98,6 +99,19 @@ def test_is_visual_worker_success_rejects_error_dict():
     assert is_visual_worker_success({"ok": True}) is True
 
 
+def test_media_worker_result_is_success_rejects_skipped_and_total_fail():
+    assert media_worker_result_is_success({"ok": True}, kind="music") is True
+    assert media_worker_result_is_success({"skipped": "empty_music_pool"}, kind="music") is False
+    assert media_worker_result_is_success({"error": "x"}, kind="sfx") is False
+    assert media_worker_result_is_success(
+        {"failed": ["cue0"], "created": 0}, kind="sfx"
+    ) is False
+    assert media_worker_result_is_success(
+        {"failed": ["cue0"], "created": 2}, kind="sfx"
+    ) is True
+    assert media_worker_result_is_success({"visuals": 0}, kind="visual") is False
+
+
 def test_media_job_row_is_clean_success():
     assert media_job_row_is_clean_success({"status": "succeeded", "kind": "music", "attributes": {}})
     assert not media_job_row_is_clean_success({"status": "failed", "kind": "visual"})
@@ -106,6 +120,9 @@ def test_media_job_row_is_clean_success():
     )
     assert not media_job_row_is_clean_success(
         {"status": "succeeded", "kind": "visual", "attributes": {"visuals": 0}}
+    )
+    assert not media_job_row_is_clean_success(
+        {"status": "succeeded", "kind": "music", "attributes": {"skipped": "empty_music_pool"}}
     )
 
 
