@@ -135,21 +135,51 @@ def render_job_patch_after_compose(
     return patch
 
 
+def _as_nonneg_int(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _is_skip_reason_soft_fail(skipped: Any) -> bool:
+    """True only for soft-fail skip *reasons* (empty pool etc.).
+
+    Worker batch returns use ``skipped`` as:
+      - str reason  → soft-fail (empty_music_pool, no_cues, ...)
+      - int count   → already-present beat count (NOT a failure by itself)
+      - list[dict]  → already_present details (NOT a failure by itself)
+      - True        → boolean skip flag (fail unless other positive work signals)
+    """
+    if skipped is None or skipped is False:
+        return False
+    if isinstance(skipped, str):
+        return bool(skipped.strip())
+    if isinstance(skipped, (int, float)):
+        return False
+    if isinstance(skipped, (list, tuple)):
+        return False
+    if skipped is True:
+        return True
+    return False
+
+
 def is_visual_worker_success(out: Any) -> bool:
     """Hard predicate for visual_run soft-error dicts.
 
     Workers that return ``{"error": "...", "visuals": 0}`` without raising used to
     mark production_jobs succeeded and green the run. That is forbidden.
+
+    Reuse-only batches (``visuals=0, reused=N``) are success — images already bound.
     """
     if not isinstance(out, dict):
-        return True
+        return False
     if out.get("error"):
         return False
-    if "visuals" in out:
-        try:
-            if int(out.get("visuals") or 0) <= 0:
-                return False
-        except (TypeError, ValueError):
+    if "visuals" in out or "reused" in out:
+        visuals = _as_nonneg_int(out.get("visuals"))
+        reused = _as_nonneg_int(out.get("reused"))
+        if visuals + reused <= 0:
             return False
     return True
 
@@ -159,26 +189,90 @@ def media_worker_result_is_success(out: Any, *, kind: str = "") -> bool:
 
     Soft-fail shapes that must NOT mark production_jobs succeeded:
     - ``{"error": ...}``
-    - ``{"skipped": ...}`` (empty music pool etc.)
+    - ``{"skipped": "<reason>"}`` string reasons (empty music pool, no_cues, ...)
     - ``{"failed": [...], "created": 0}`` total SFX/visual batch miss
-    - visual-specific: zero visuals / error (via is_visual_worker_success)
+    - visual-specific: zero visuals+reused / error (via is_visual_worker_success)
+
+    Already-present batch counts/lists are NOT soft-fail:
+    - voiceover ``skipped: 3`` (beats already current)
+    - visual ``skipped: 1`` / ``reused: 4``
+    - sfx ``skipped: [{reason: already_present}, ...]`` with created>=0
     """
     if not isinstance(out, dict):
-        return True
+        return False
     if out.get("error"):
         return False
-    if out.get("skipped"):
+    # Music also surfaces skip_reason / status without always setting skipped.
+    skip_reason = out.get("skip_reason")
+    if isinstance(skip_reason, str) and skip_reason.strip():
         return False
+    if out.get("status") in {"empty_pool", "no_candidates"}:
+        return False
+    if _is_skip_reason_soft_fail(out.get("skipped")):
+        return False
+
     failed = out.get("failed")
     if isinstance(failed, list) and len(failed) > 0:
-        try:
-            created = int(out.get("created") or 0)
-        except (TypeError, ValueError):
-            created = 0
+        created = _as_nonneg_int(
+            out.get("created")
+            if out.get("created") is not None
+            else (out.get("voiceovers") if out.get("voiceovers") is not None else out.get("visuals"))
+        )
         if created <= 0:
             return False
-    if kind == "visual" or "visuals" in out:
+
+    kind_l = (kind or "").lower()
+    if kind_l == "visual" or "visuals" in out or "reused" in out:
+        # Empty attrs on a succeeded job row = legacy clean (no worker payload stored).
+        if "visuals" not in out and "reused" not in out:
+            return True
         return is_visual_worker_success(out)
+
+    if kind_l == "voiceover" or "voiceovers" in out:
+        has_batch_keys = (
+            "voiceovers" in out
+            or isinstance(out.get("skipped"), (int, float, list, tuple))
+            or "failed" in out
+        )
+        if not has_batch_keys:
+            return True  # legacy empty attributes on clean succeeded job
+        voiceovers = _as_nonneg_int(out.get("voiceovers"))
+        skipped = out.get("skipped")
+        if isinstance(skipped, (list, tuple)):
+            skipped_n = len(skipped)
+        else:
+            skipped_n = _as_nonneg_int(skipped)
+        # Zero work and zero already-present = silent empty success — fail-loud.
+        return (voiceovers + skipped_n) > 0
+
+    if kind_l == "sfx" or (
+        "created" in out and ("failed" in out or "details" in out)
+    ):
+        has_batch_keys = any(k in out for k in ("created", "failed", "skipped", "details"))
+        if not has_batch_keys:
+            return True  # legacy empty attributes
+        created = _as_nonneg_int(out.get("created"))
+        if created > 0:
+            return True
+        if isinstance(failed, list) and len(failed) > 0:
+            return False
+        skipped = out.get("skipped")
+        # All cues already_present → sfx is on the timeline; clean success.
+        if isinstance(skipped, (list, tuple)) and len(skipped) > 0:
+            return True
+        # created=0, no skips, no fails — empty batch (should have used skip reason).
+        return False
+
+    if kind_l == "music":
+        if out.get("music") == "already_present" or out.get("artifact_id"):
+            return True
+        if out.get("ok") is True:
+            return True
+        # Opaque/empty success payload without skip signals = clean (legacy attrs {}).
+        if not any(k in out for k in ("skipped", "skip_reason", "status", "error", "created")):
+            return True
+        return False
+
     return True
 
 
@@ -191,7 +285,10 @@ def media_job_row_is_clean_success(row: dict[str, Any] | None) -> bool:
     attrs = row.get("attributes") if isinstance(row.get("attributes"), dict) else {}
     if attrs.get("error"):
         return False
-    if attrs.get("skipped"):
+    # Only string skip *reasons* poison a succeeded row (not skip counts/lists).
+    if _is_skip_reason_soft_fail(attrs.get("skipped")):
+        return False
+    if isinstance(attrs.get("skip_reason"), str) and attrs.get("skip_reason").strip():
         return False
     kind = str(row.get("kind") or "")
     if not media_worker_result_is_success(attrs, kind=kind):

@@ -97,6 +97,7 @@ def test_is_visual_worker_success_rejects_error_dict():
     assert is_visual_worker_success({"visuals": 0}) is False
     assert is_visual_worker_success({"visuals": 3}) is True
     assert is_visual_worker_success({"ok": True}) is True
+    assert is_visual_worker_success({"visuals": 0, "reused": 4}) is True
 
 
 def test_media_worker_result_is_success_rejects_skipped_and_total_fail():
@@ -110,6 +111,32 @@ def test_media_worker_result_is_success_rejects_skipped_and_total_fail():
         {"failed": ["cue0"], "created": 2}, kind="sfx"
     ) is True
     assert media_worker_result_is_success({"visuals": 0}, kind="visual") is False
+    # Batch skip counts/lists are NOT soft-fail (already-present work).
+    assert media_worker_result_is_success(
+        {"voiceovers": 3, "skipped": 2, "failed": []}, kind="voiceover"
+    ) is True
+    assert media_worker_result_is_success(
+        {"voiceovers": 0, "skipped": 5, "failed": []}, kind="voiceover"
+    ) is True
+    assert media_worker_result_is_success(
+        {"voiceovers": 0, "skipped": 0, "failed": []}, kind="voiceover"
+    ) is False
+    assert media_worker_result_is_success(
+        {"visuals": 3, "skipped": 1, "failed": []}, kind="visual"
+    ) is True
+    assert media_worker_result_is_success(
+        {"visuals": 0, "reused": 4, "skipped": 0}, kind="visual"
+    ) is True
+    assert media_worker_result_is_success(
+        {"created": 0, "skipped": [{"reason": "already_present"}], "failed": []},
+        kind="sfx",
+    ) is True
+    assert media_worker_result_is_success(
+        {"created": 0, "skipped": [], "failed": []}, kind="sfx"
+    ) is False
+    assert media_worker_result_is_success(
+        {"music": "already_present"}, kind="music"
+    ) is True
 
 
 def test_media_job_row_is_clean_success():
