@@ -15,8 +15,9 @@ BUCKET = "hiob-artifacts"
 # create a second brand vs "viewok"). The real fix is a brand table (napkin DATA
 # MODEL); this is the interim normalizer. Migration 0019 merged the existing fork.
 BRAND_ALIASES: dict[str, str] = {
+    # display-name → canonical slug (never reverse: slug→display forked tenant chrome)
     "뷰오케이": "viewok",
-    "hiob-marketing": "히옵 마케팅",
+    "히옵 마케팅": "hiob-marketing",
     "차트의 품격": "chart-leaders",
 }
 
