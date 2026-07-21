@@ -3,8 +3,11 @@ from hiob_platform.agent_outputs import _latest_art_director_output
 from hiob_platform.client import get_service_client
 from hiob_platform.runs import (
     APPROVED_SCRIPT_STATUSES,
+    assert_editor_approved,
     assert_run_script_gate,
     create_production_job,
+    is_editor_gate_enabled,
+    is_editor_gate_legacy_allow,
     create_slot,
     create_text_artifact,
     end_run,
@@ -71,7 +74,10 @@ __all__ = [
     "_latest_art_director_output",
     "get_service_client",
     "APPROVED_SCRIPT_STATUSES",
+    "assert_editor_approved",
     "assert_run_script_gate",
+    "is_editor_gate_enabled",
+    "is_editor_gate_legacy_allow",
     "create_production_job",
     "get_run_script_status",
     "is_visual_worker_success",

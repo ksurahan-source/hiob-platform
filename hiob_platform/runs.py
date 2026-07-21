@@ -1,7 +1,8 @@
 """Run + slot + artifact + span write helpers (service-role only)."""
 from __future__ import annotations
 
-from typing import Any
+import os
+from typing import Any, Mapping
 
 from supabase import Client
 
@@ -9,6 +10,10 @@ APPROVED_SCRIPT_STATUSES = frozenset({"approved", "queued", "produced"})
 REQUIRED_PRODUCTION_WORK_KINDS = frozenset({"visual", "voiceover", "music", "sfx"})
 OPTIONAL_PRODUCTION_WORK_KINDS = frozenset({"caption", "title_style"})
 PRODUCTION_WORK_KINDS = REQUIRED_PRODUCTION_WORK_KINDS | OPTIONAL_PRODUCTION_WORK_KINDS
+
+# SEC-C2: mirror Studio lib/editorGate.js env contract.
+_GATE_OFF = frozenset({"0", "false", "off", "no"})
+_LEGACY_ON = frozenset({"1", "true", "yes", "on"})
 
 
 def get_run_script_status(client: Client, run_id: str) -> str | None:
@@ -46,6 +51,60 @@ def assert_run_script_gate(
             f"(run.script_status={status or 'null'}, allowed={allowed_text})"
         )
     return status
+
+
+def _env_flag(env: Mapping[str, str] | None, key: str) -> str:
+    src = env if env is not None else os.environ
+    return str(src.get(key) or "").strip().lower()
+
+
+def is_editor_gate_enabled(env: Mapping[str, str] | None = None) -> bool:
+    """Default ON. Off only when HIOB_EDITOR_GATE is 0|false|off|no."""
+    return _env_flag(env, "HIOB_EDITOR_GATE") not in _GATE_OFF
+
+
+def is_editor_gate_legacy_allow(env: Mapping[str, str] | None = None) -> bool:
+    """Default OFF. Soft-allow missing approval only when LEGACY_ALLOW truthy."""
+    return _env_flag(env, "HIOB_EDITOR_GATE_LEGACY_ALLOW") in _LEGACY_ON
+
+
+def assert_editor_approved(
+    client: Client,
+    run_id: str,
+    *,
+    operation: str = "compose",
+    env: Mapping[str, str] | None = None,
+) -> str:
+    """SEC-C2: require run.attributes.editor_approved_at (Studio L2 parity on Modal).
+
+    Returns:
+      * ISO timestamp when approved
+      * ``\"bypassed\"`` when HIOB_EDITOR_GATE off
+      * ``\"legacy\"`` when LEGACY_ALLOW and missing at
+
+    Raises RuntimeError with EDITOR_APPROVAL_REQUIRED when blocked.
+    """
+    if not is_editor_gate_enabled(env):
+        return "bypassed"
+    rows = (
+        client.table("run")
+        .select("id, attributes")
+        .eq("id", run_id)
+        .limit(1)
+        .execute()
+        .data
+    )
+    attrs = (rows[0].get("attributes") if rows else None) or {}
+    if not isinstance(attrs, dict):
+        attrs = {}
+    at = attrs.get("editor_approved_at")
+    if at:
+        return str(at)
+    if is_editor_gate_legacy_allow(env):
+        return "legacy"
+    raise RuntimeError(
+        f"{operation} blocked: editor approval required (EDITOR_APPROVAL_REQUIRED)"
+    )
 
 
 def update_production_job(
