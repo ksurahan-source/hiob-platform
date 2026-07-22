@@ -16,6 +16,7 @@ if str(ROOT) not in sys.path:
 from hiob_platform.runs import (  # noqa: E402
     is_visual_worker_success,
     mark_preview_produced,
+    mark_run_media_failed,
     media_job_row_is_clean_success,
     media_worker_result_is_success,
     maybe_mark_run_produced,
@@ -70,9 +71,14 @@ class _FakeQuery:
             run_id = self._filters.get("id")
             for r in self.client.runs:
                 if r["id"] == run_id:
+                    # Column update only — never replace attributes bag unless explicit.
+                    if "attributes" in self._payload:
+                        raise AssertionError(
+                            "T12/N11: run.update must not full-bag replace attributes"
+                        )
                     r.update(self._payload)
-                    self.client.last_run_update = dict(r)
-                    return type("R", (), {"data": [r]})()
+                    self.client.last_run_update = dict(self._payload)
+                    return type("R", (), {"data": [dict(r)]})()
             return type("R", (), {"data": []})()
         if self.table_name == "slot" and self._op == "select":
             run_id = self._filters.get("run_id")
@@ -87,9 +93,32 @@ class FakeClient:
         self.runs = []
         self.slots = []
         self.last_run_update = None
+        self.rpc_calls: list[tuple[str, dict]] = []
 
     def table(self, name):
         return _FakeQuery(self, name)
+
+    def rpc(self, name, params):
+        self.rpc_calls.append((name, dict(params)))
+        if name == "set_run_attr":
+            run_id = str(params.get("p_run_id") or "")
+            key = str(params.get("p_key") or "")
+            value = params.get("p_value")
+            for r in self.runs:
+                if r["id"] == run_id:
+                    attrs = r.setdefault("attributes", {})
+                    if not isinstance(attrs, dict):
+                        attrs = {}
+                        r["attributes"] = attrs
+                    # Merge-on-write (jsonb_set) — preserve sibling keys.
+                    attrs[key] = value
+                    break
+
+        class _Rpc:
+            def execute(self_inner):
+                return type("R", (), {"data": None})()
+
+        return _Rpc()
 
 
 def test_is_visual_worker_success_rejects_error_dict():
@@ -169,7 +198,14 @@ def test_maybe_mark_run_produced_blocks_soft_visual_success():
 
 def test_maybe_mark_run_produced_fails_run_on_required_job_failed():
     c = FakeClient()
-    c.runs = [{"id": "r1", "script_status": "queued", "status": "running", "attributes": {}}]
+    c.runs = [
+        {
+            "id": "r1",
+            "script_status": "queued",
+            "status": "running",
+            "attributes": {"keep_me": "alive", "beat_plan": {"n": 1}},
+        }
+    ]
     c.jobs = [
         {"id": "j1", "run_id": "r1", "kind": "visual", "status": "failed", "attributes": {}},
         {"id": "j2", "run_id": "r1", "kind": "voiceover", "status": "succeeded", "attributes": {}},
@@ -180,6 +216,49 @@ def test_maybe_mark_run_produced_fails_run_on_required_job_failed():
     assert out.get("status") == "failed"
     assert out.get("script_status") == "failed"
     assert "visual" in str(out.get("attributes", {}).get("produce_error", ""))
+    # N11: sibling bag keys must survive (set_run_attr merge, not full-bag wipe).
+    assert c.runs[0]["attributes"]["keep_me"] == "alive"
+    assert c.runs[0]["attributes"]["beat_plan"] == {"n": 1}
+    assert c.runs[0]["attributes"]["fail_loud"] is True
+    assert c.runs[0]["attributes"]["fail_stage"] == "media_jobs"
+    rpc_keys = [p["p_key"] for n, p in c.rpc_calls if n == "set_run_attr"]
+    assert rpc_keys == ["produce_error", "fail_loud", "fail_stage"]
+    assert c.last_run_update is not None
+    assert "attributes" not in c.last_run_update
+
+
+def test_mark_run_media_failed_uses_set_run_attr_no_bag_wipe():
+    """N11 residual: mark_run_media_failed must not PATCH attributes with partial bag."""
+    c = FakeClient()
+    c.runs = [
+        {
+            "id": "r-wipe",
+            "script_status": "producing",
+            "status": "running",
+            "attributes": {
+                "side_jobs": {"x": 1},
+                "parzifal_master_sheet": {"ok": True},
+                "editor_approved_at": "2026-07-22T00:00:00Z",
+            },
+        }
+    ]
+    out = mark_run_media_failed(c, "r-wipe", reason="required media jobs failed: visual")
+    assert out["status"] == "failed"
+    assert out["script_status"] == "failed"
+    assert "attributes" not in (c.last_run_update or {})
+    bag = c.runs[0]["attributes"]
+    assert bag["side_jobs"] == {"x": 1}
+    assert bag["parzifal_master_sheet"] == {"ok": True}
+    assert bag["editor_approved_at"] == "2026-07-22T00:00:00Z"
+    assert bag["produce_error"].startswith("required media jobs failed")
+    assert bag["fail_loud"] is True
+    assert bag["fail_stage"] == "media_jobs"
+    assert all(n == "set_run_attr" for n, _ in c.rpc_calls)
+    assert {p["p_key"] for _, p in c.rpc_calls} == {
+        "produce_error",
+        "fail_loud",
+        "fail_stage",
+    }
 
 
 def test_maybe_mark_run_produced_marks_preview_only_on_clean_success():

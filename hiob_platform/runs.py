@@ -363,20 +363,56 @@ def mark_preview_produced(client: Client, run_id: str) -> dict:
     return set_run_script_status(client, run_id, "produced")
 
 
+def set_run_attr(client: Client, run_id: str, key: str, value: Any) -> None:
+    """Atomic partial write of ``run.attributes[key]`` via ``set_run_attr`` RPC.
+
+    Full-bag ``UPDATE run.attributes = {only_some_keys}`` wipes concurrent keys
+    (T09/T12). Single-key stamps must use this helper (jsonb_set merge-on-write).
+    """
+    client.rpc(
+        "set_run_attr",
+        {"p_run_id": str(run_id), "p_key": str(key), "p_value": value},
+    ).execute()
+
+
 def mark_run_media_failed(client: Client, run_id: str, *, reason: str) -> dict:
-    """Fail-loud terminal when required media jobs die — never stuck queued forever."""
+    """Fail-loud terminal when required media jobs die — never stuck queued forever.
+
+    Status/script_status/ended_at via column update only. Fail stamps
+    (produce_error, fail_loud, fail_stage) via per-key ``set_run_attr`` so we
+    never partial-bag-wipe existing run.attributes (N2 residual / T12).
+    """
+    reason_s = str(reason)[:500]
     payload: dict[str, Any] = {
         "status": "failed",
         "script_status": "failed",
         "ended_at": "now()",
+    }
+    res = client.table("run").update(payload).eq("id", run_id).execute()
+    set_run_attr(client, run_id, "produce_error", reason_s)
+    set_run_attr(client, run_id, "fail_loud", True)
+    set_run_attr(client, run_id, "fail_stage", "media_jobs")
+    row = res.data[0] if res.data else {}
+    # Surface fail stamps on the returned dict for callers; does not write bag.
+    if row:
+        attrs = dict(row["attributes"]) if isinstance(row.get("attributes"), dict) else {}
+        attrs.update(
+            {
+                "produce_error": reason_s,
+                "fail_loud": True,
+                "fail_stage": "media_jobs",
+            }
+        )
+        return {**row, "attributes": attrs}
+    return {
+        "status": "failed",
+        "script_status": "failed",
         "attributes": {
-            "produce_error": str(reason)[:500],
+            "produce_error": reason_s,
             "fail_loud": True,
             "fail_stage": "media_jobs",
         },
     }
-    res = client.table("run").update(payload).eq("id", run_id).execute()
-    return res.data[0] if res.data else {}
 
 
 def maybe_mark_run_produced(client: Client, run_id: str) -> dict:
