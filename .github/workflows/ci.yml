@@ -1,5 +1,21 @@
 name: ci
-on: [push, pull_request]
+
+# Avoid double runs on open PRs (push + pull_request):
+# - feature branches: pull_request only
+# - main: push only
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 jobs:
   test:
     runs-on: ubuntu-latest
