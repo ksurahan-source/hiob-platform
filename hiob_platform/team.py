@@ -24,6 +24,15 @@ DEFAULT_TEAM_ROLES: tuple[str, ...] = (
     "qa",
 )
 
+_DATABASE_NOW = "now()"
+_NOT_IS = "not.is"
+_SELECT_ID_KIND = "id, kind"
+_SELECT_ID_MARKERS = "id, markers"
+_SELECT_ID_DURATION = "id, duration_ms"
+_SELECT_START_DURATION = "start_ms, duration_ms"
+_NO_TIMELINE = "no timeline"
+_NO_VIDEO_TRACK = "no video track"
+
 
 def create_team(client: Client, *, run_id: str, keyword: str) -> dict:
     res = (
@@ -70,7 +79,7 @@ def create_call(
 def start_call(client: Client, call_id: str) -> dict:
     res = (
         client.table("agent_call")
-        .update({"status": "running", "started_at": "now()"})
+        .update({"status": "running", "started_at": _DATABASE_NOW})
         .eq("id", call_id)
         .execute()
     )
@@ -89,7 +98,7 @@ def finish_call(
 ) -> dict:
     payload: dict[str, Any] = {
         "status": "error" if error else "ok",
-        "ended_at": "now()",
+        "ended_at": _DATABASE_NOW,
         "tokens_in": tokens_in,
         "tokens_out": tokens_out,
         "cost_usd": cost_usd,
@@ -282,7 +291,7 @@ def create_clip(
 def update_timeline_markers(client: Client, timeline_id: str, markers: list[dict]) -> dict:
     res = (
         client.table("timeline")
-        .update({"markers": markers, "updated_at": "now()"})
+        .update({"markers": markers, "updated_at": _DATABASE_NOW})
         .eq("id", timeline_id)
         .execute()
     )
@@ -308,130 +317,160 @@ _SLOT_TRACK_TO_CLIP_KIND: dict[str, str] = {
 _BEAT_MS: int = 1000
 
 
-def verify_slots_coverage(client: Client, run_id: str) -> dict[str, Any]:
-    """Diagnostic gate: verify all beats have ≥1 voice (audio/sfx) slot.
-
-    This is Stage 1 of the 3-stage sync closure (PRD §4.2). Checks whether every
-    beat has artifact-backed slots before attempting to bind them to clips.
-
-    Args:
-        client: Supabase client
-        run_id: Run ID to diagnose
-
-    Returns:
-        {
-          "ok": bool,
-          "violations": ["beat_N: reason" ...],  # Critical failures
-          "warnings": ["beat_N: reason" ...]     # Non-critical issues (sub-shot, etc)
-        }
-
-    Example (ViewOK run 51399, beat 3 SFX only, no voice):
-        {
-            "ok": False,
-            "violations": ["beat_3: voice_slots=0 (no audio/sfx with artifact_id)"],
-            "warnings": ["beat_3: sub-shot SFX (beat_index=NULL) exists but won't bind"]
-        }
-    """
-    # 1. Fetch all slots for this run with artifacts attached.
-    slot_rows: list[dict] = (
-        client.table("slot")
-        .select("id, track, beat_index, start_ms, current_artifact_id")
-        .eq("run_id", run_id)
-        .filter("current_artifact_id", "not.is", "null")
-        .execute()
-        .data
-    ) or []
-
-    if not slot_rows:
-        return {
-            "ok": False,
-            "violations": ["no slots with artifacts found for this run"],
-            "warnings": [],
-        }
-
-    # 2. Categorize slots by beat_index and kind (voice vs SFX).
+def _slot_coverage_inventory(
+    slot_rows: list[dict],
+) -> tuple[dict[int, int], dict[int, int], list[str]]:
     voice_by_beat: dict[int, int] = defaultdict(int)
     sfx_by_beat: dict[int, int] = defaultdict(int)
-    subshot_warnings: list[str] = []
-
+    warnings: list[str] = []
     for slot in slot_rows:
         bi = slot.get("beat_index")
         kind = _SLOT_TRACK_TO_CLIP_KIND.get(slot["track"])
-
         if kind == "audio":
             if bi is not None:
                 voice_by_beat[int(bi)] += 1
             else:
-                subshot_warnings.append(
+                warnings.append(
                     f"voice sub-shot at {slot.get('start_ms')}ms (beat_index=NULL, will use start_ms fallback)"
                 )
         elif kind == "sfx":
             if bi is not None:
                 sfx_by_beat[int(bi)] += 1
             else:
-                subshot_warnings.append(
+                warnings.append(
                     f"SFX sub-shot at {slot.get('start_ms')}ms (beat_index=NULL, will use start_ms fallback)"
                 )
+    return voice_by_beat, sfx_by_beat, warnings
 
-    # 3. Determine the range of beat indices present.
+
+def _evaluate_slot_coverage(slot_rows: list[dict]) -> dict[str, Any]:
+    voice_by_beat, sfx_by_beat, warnings = _slot_coverage_inventory(slot_rows)
     all_beats = set(voice_by_beat.keys()) | set(sfx_by_beat.keys())
     if not all_beats:
         return {
             "ok": False,
             "violations": ["no beat-indexed voice or SFX slots found"],
-            "warnings": subshot_warnings,
+            "warnings": warnings,
         }
-
     max_beat = max(all_beats)
-
-    # 4. Check each beat for voice coverage (critical), SFX is secondary.
-    violations = []
+    violations: list[str] = []
     for beat_idx in range(max_beat + 1):
         voice_count = voice_by_beat.get(beat_idx, 0)
         sfx_count = sfx_by_beat.get(beat_idx, 0)
-
-        # Critical: beat has no voice at all (audio + sfx = 0)
         if voice_count == 0 and sfx_count == 0:
             violations.append(
                 f"beat_{beat_idx}: no voice or SFX slots (voice={voice_count}, sfx={sfx_count})"
             )
-        # Warning: beat has SFX only (may be silent risk if SFX doesn't cover full beat)
         elif voice_count == 0 and sfx_count > 0:
             violations.append(
                 f"beat_{beat_idx}: SFX-only (voice_slots=0, silent risk if SFX incomplete)"
             )
-
     return {
-        "ok": len(violations) == 0,
+        "ok": not violations,
         "violations": violations,
-        "warnings": subshot_warnings,
+        "warnings": warnings,
     }
 
 
-def sync_clips_from_slots(client: Client, run_id: str) -> dict:
-    """Backfill ``clip.artifact_id`` from ``slot.current_artifact_id``.
-
-    Workers upload artifacts to slots (setting ``slot.current_artifact_id``)
-    but never patch the timeline clips that were created as placeholders.
-    This function links the two so the editor can resolve clip→artifact→URL.
-
-    Stage 2 of 3-stage closure (PRD §4.2): implements 1:N lossless sync.
-    Multiple slots per beat (J/L cut pattern, voice A + voice B) now map to
-    multiple clips. **All artifacts bind, no loss**.
-
-    Only updates clips where ``artifact_id IS NULL`` to avoid overwriting
-    any user or automated edits that already placed a specific artifact.
-
-    Returns ``{"updated": <count>, "run_id": <run_id>}``.
-    """
-    # 1. All slots for this run that already have an artifact attached.
-    # supabase-py 2.x made `.not_` a chainable property (no longer callable),
-    # so use the explicit .filter() form with "not.is" for "IS NOT NULL".
+def verify_slots_coverage(client: Client, run_id: str) -> dict[str, Any]:
+    """Verify that every beat has artifact-backed voice coverage."""
     slot_rows: list[dict] = (
         client.table("slot")
         .select("id, track, beat_index, start_ms, current_artifact_id")
         .eq("run_id", run_id)
-        .filter("current_artifact_id", "not.is", "null")
+        .filter("current_artifact_id", _NOT_IS, "null")
+        .execute()
+        .data
+    ) or []
+    if not slot_rows:
+        return {
+            "ok": False,
+            "violations": ["no slots with artifacts found for this run"],
+            "warnings": [],
+        }
+    return _evaluate_slot_coverage(slot_rows)
+
+
+def _artifact_duration_by_id(client: Client, slot_rows: list[dict]) -> dict[str, dict]:
+    artifact_ids = [
+        slot["current_artifact_id"]
+        for slot in slot_rows
+        if slot.get("current_artifact_id")
+    ]
+    if not artifact_ids:
+        return {}
+    rows = (
+        client.table("artifact")
+        .select(_SELECT_ID_DURATION)
+        .in_("id", artifact_ids)
+        .execute()
+        .data
+        or []
+    )
+    return {row["id"]: row for row in rows}
+
+
+def _index_unbound_clips(
+    clips: list[dict], tracks: list[dict]
+) -> tuple[
+    dict[tuple[int, str], list[dict]],
+    dict[tuple[int, str], list[dict]],
+]:
+    kind_by_track = {track["id"]: track["kind"] for track in tracks}
+    by_beat: dict[tuple[int, str], list[dict]] = defaultdict(list)
+    by_start: dict[tuple[int, str], list[dict]] = defaultdict(list)
+    for clip in clips:
+        kind = kind_by_track.get(clip["track_id"])
+        if not kind:
+            continue
+        beat = clip.get("beat_index")
+        if beat is not None:
+            by_beat[(int(beat), kind)].append(clip)
+            continue
+        key = (int(clip.get("start_ms") or 0), kind)
+        if not by_start[key]:
+            by_start[key].append(clip)
+    return by_beat, by_start
+
+
+def _bind_slot_artifacts(
+    client: Client,
+    slot_rows: list[dict],
+    artifact_by_id: dict[str, dict],
+    clips_by_beat: dict[tuple[int, str], list[dict]],
+    clips_by_start: dict[tuple[int, str], list[dict]],
+) -> int:
+    updated = 0
+    for slot in slot_rows:
+        clip_kind = _SLOT_TRACK_TO_CLIP_KIND.get(slot["track"])
+        if not clip_kind:
+            continue
+        beat = slot.get("beat_index")
+        if beat is None:
+            key = (int(slot.get("start_ms") or 0), clip_kind)
+            target_clips = clips_by_start.pop(key, [])
+        else:
+            target_clips = clips_by_beat.pop((int(beat), clip_kind), [])
+        for target in target_clips:
+            patch: dict[str, Any] = {
+                "artifact_id": slot["current_artifact_id"],
+                "updated_at": _DATABASE_NOW,
+            }
+            artifact = artifact_by_id.get(slot["current_artifact_id"]) or {}
+            if clip_kind == "audio" and artifact.get("duration_ms"):
+                patch["duration_ms"] = max(100, int(artifact["duration_ms"]))
+            client.table("clip").update(patch).eq("id", target["id"]).execute()
+            updated += 1
+    return updated
+
+
+def sync_clips_from_slots(client: Client, run_id: str) -> dict:
+    """Bind every artifact-backed slot to all matching unbound clips."""
+    slot_rows: list[dict] = (
+        client.table("slot")
+        .select("id, track, beat_index, start_ms, current_artifact_id")
+        .eq("run_id", run_id)
+        .filter("current_artifact_id", _NOT_IS, "null")
         .execute()
         .data
     ) or []
@@ -442,7 +481,7 @@ def sync_clips_from_slots(client: Client, run_id: str) -> dict:
     # 2. Timeline for this run; extract per-beat durations from markers.
     tl = (
         client.table("timeline")
-        .select("id, markers")
+        .select(_SELECT_ID_MARKERS)
         .eq("run_id", run_id)
         .limit(1)
         .execute()
@@ -451,17 +490,6 @@ def sync_clips_from_slots(client: Client, run_id: str) -> dict:
     if not tl:
         return {"updated": 0, "run_id": run_id}
     timeline_id = tl[0]["id"]
-
-    # Extract beat_index → beat_duration_ms mapping from markers (decouple from _BEAT_MS grid).
-    beat_duration_by_idx: dict[int, int] = {}
-    markers = tl[0].get("markers") or []
-    for marker in markers:
-        if marker.get("beatIndex") is not None and marker.get("durationMs") is not None:
-            beat_duration_by_idx[int(marker["beatIndex"])] = int(marker["durationMs"])
-
-    # 3. Tracks → map kind → track ids. Some kinds are intentionally duplicated:
-    # Voice A and Voice B are both kind="audio" with different ord values, so a
-    # flat kind→id map silently drops one lane and leaves voice clips unlinked.
     tracks: list[dict] = (
         client.table("timeline_track")
         .select("id, kind, ord")
@@ -470,28 +498,10 @@ def sync_clips_from_slots(client: Client, run_id: str) -> dict:
         .execute()
         .data
     ) or []
-
-    track_ids_by_kind: dict[str, list[str]] = {}
-    for track in tracks:
-        track_ids_by_kind.setdefault(track["kind"], []).append(track["id"])
-    all_track_ids = [t["id"] for t in tracks]
-
+    all_track_ids = [track["id"] for track in tracks]
     if not all_track_ids:
         return {"updated": 0, "run_id": run_id}
-
-    artifact_ids = [s["current_artifact_id"] for s in slot_rows if s.get("current_artifact_id")]
-    artifact_rows: list[dict] = (
-        client.table("artifact")
-        .select("id, duration_ms")
-        .in_("id", artifact_ids)
-        .execute()
-        .data
-        if artifact_ids
-        else []
-    ) or []
-    artifact_by_id = {a["id"]: a for a in artifact_rows}
-
-    # 4. Clips that still need an artifact (artifact_id IS NULL).
+    artifact_by_id = _artifact_duration_by_id(client, slot_rows)
     null_clips: list[dict] = (
         client.table("clip")
         .select("id, track_id, start_ms, beat_index, duration_ms")
@@ -503,59 +513,10 @@ def sync_clips_from_slots(client: Client, run_id: str) -> dict:
 
     if not null_clips:
         return {"updated": 0, "run_id": run_id}
-
-    # Build a direct track_id → kind map for O(1) clip→kind lookup.
-    track_kind_by_id: dict[str, str] = {t["id"]: t["kind"] for t in tracks}
-
-    # 5. Index null clips by (beat_index, clip_kind) → LIST OF CLIPS (1:N, Stage 2).
-    # Multiple clips per beat are now collected in a list, not overwritten.
-    clip_by_beat_kind: dict[tuple[int, str], list[dict]] = defaultdict(list)
-    clip_by_ms_kind: dict[tuple[int, str], list[dict]] = defaultdict(list)
-
-    for clip in null_clips:
-        kind = track_kind_by_id.get(clip["track_id"])
-        if not kind:
-            continue
-        bi = clip.get("beat_index")
-        if bi is not None:
-            clip_by_beat_kind[(int(bi), kind)].append(clip)
-        else:
-            ms = int(clip.get("start_ms") or 0)
-            # For start_ms keying, keep only the first clip per (ms, kind) to avoid
-            # duplicating non-beat-indexed clips across multiple slots.
-            if not clip_by_ms_kind[(ms, kind)]:
-                clip_by_ms_kind[(ms, kind)].append(clip)
-
-    # 6. Match each slot to all its clips via (beat_index, clip_kind); patch artifact_id.
-    # Stage 2: iterate over ALL clips in the list, not just pop() the first.
-    # Prefer beat-keyed lookup (using beat_index + per-beat duration from markers) when available;
-    # fall back to start_ms for true orphans (beat_index=NULL).
-    updated = 0
-    for slot in slot_rows:
-        clip_kind = _SLOT_TRACK_TO_CLIP_KIND.get(slot["track"])
-        if not clip_kind:
-            continue
-
-        beat_index = slot.get("beat_index")
-        start_ms = int(slot.get("start_ms") or 0)
-
-        if beat_index is not None:
-            target_clips = clip_by_beat_kind.pop((int(beat_index), clip_kind), [])
-        else:
-            # No beat_index (orphan sub-shot): match by start_ms (music full-clip, sfx non-beat slots)
-            target_clips = clip_by_ms_kind.pop((start_ms, clip_kind), [])
-
-        # Stage 2: bind ALL clips (not just first).
-        for target_clip in target_clips:
-            patch: dict[str, Any] = {"artifact_id": slot["current_artifact_id"], "updated_at": "now()"}
-            artifact = artifact_by_id.get(slot["current_artifact_id"]) or {}
-            if clip_kind == "audio" and artifact.get("duration_ms"):
-                # Voice turns must stay uncut (napkin I4). Use the measured TTS
-                # duration instead of the placeholder 1000ms beat duration.
-                patch["duration_ms"] = max(100, int(artifact["duration_ms"]))
-            client.table("clip").update(patch).eq("id", target_clip["id"]).execute()
-            updated += 1
-
+    by_beat, by_start = _index_unbound_clips(null_clips, tracks)
+    updated = _bind_slot_artifacts(
+        client, slot_rows, artifact_by_id, by_beat, by_start
+    )
     print(f"[SYNC-CLIPS] run={run_id} updated={updated} (all artifacts, no loss)")
     return {"updated": updated, "run_id": run_id}
 
@@ -617,107 +578,351 @@ def _beat_duration_ms(audio_ms: int) -> int:
     return max(_REPACK_MIN_MS, int(audio_ms) + _BEAT_PAD_MS)
 
 
+def _repack_sample(client: Client, timeline_id: str) -> list[dict]:
+    rows = (
+        client.table("timeline_track")
+        .select(_SELECT_ID_KIND)
+        .eq("timeline_id", timeline_id)
+        .in_("kind", ["video", "audio", "caption"])
+        .execute()
+        .data
+        or []
+    )
+    return (
+        client.table("clip")
+        .select("start_ms, beat_index, track_id")
+        .in_("track_id", [row["id"] for row in rows])
+        .limit(500)
+        .execute()
+        .data
+        or []
+    )
+
+
+def _clips_are_packed(sample: list[dict]) -> bool:
+    return bool(
+        sample
+        and any(
+            row.get("beat_index") is not None
+            and int(row.get("beat_index") or 0) >= 1
+            and int(row.get("start_ms") or 0)
+            != int(row.get("beat_index") or 0) * _BEAT_MS
+            for row in sample
+        )
+    )
+
+
+def _partition_repack_tracks(
+    tracks: list[dict],
+) -> tuple[dict[str, list[str]], dict[str, str]]:
+    aligned = {"audio": [], "video": [], "caption": []}
+    singleton: dict[str, str] = {}
+    for track in tracks:
+        kind = track["kind"]
+        if kind in aligned:
+            aligned[kind].append(track["id"])
+        else:
+            singleton[kind] = track["id"]
+    return aligned, singleton
+
+
+def _slots_are_packed(slots: list[dict]) -> bool:
+    return any(
+        int(slot.get("start_ms") or 0)
+        != int(slot.get("beat_index") or 0) * _BEAT_MS
+        for slot in slots
+        if slot.get("beat_index") is not None
+    )
+
+
+def _load_repack_durations(client: Client, slots: list[dict]) -> dict[str, int]:
+    artifact_ids = [
+        slot["current_artifact_id"]
+        for slot in slots
+        if slot["current_artifact_id"]
+    ]
+    if not artifact_ids:
+        return {}
+    rows = (
+        client.table("artifact")
+        .select(_SELECT_ID_DURATION)
+        .in_("id", artifact_ids)
+        .execute()
+        .data
+        or []
+    )
+    return {row["id"]: (row.get("duration_ms") or 0) for row in rows}
+
+
+def _load_scene_types(client: Client, audio_track_ids: list[str]) -> dict[int, str]:
+    if not audio_track_ids:
+        return {}
+    rows = (
+        client.table("clip")
+        .select("beat_index, attributes")
+        .in_("track_id", audio_track_ids)
+        .not_.is_("beat_index", "null")
+        .execute()
+        .data
+        or []
+    )
+    return {
+        int(row["beat_index"]): str(
+            (row.get("attributes") or {}).get("scene_type") or ""
+        ).lower()
+        for row in rows
+        if row.get("beat_index") is not None
+    }
+
+
+def _build_repack_plan(
+    slots: list[dict],
+    durations: dict[str, int],
+    scene_types: dict[int, str],
+) -> tuple[list[dict[str, int]], int]:
+    cursor_ms = 0
+    plan: list[dict[str, int]] = []
+    previous_voiced = False
+    for slot in slots:
+        beat = slot.get("beat_index")
+        if beat is None:
+            continue
+        artifact_id = slot.get("current_artifact_id")
+        audio_ms = durations.get(artifact_id, 0) if artifact_id else 0
+        voiced = audio_ms > 0
+        duration_ms = _beat_duration_ms(audio_ms) + _scene_breath_ms(
+            scene_types.get(int(beat), ""), voiced
+        )
+        overlap = _VOICE_OVERLAP_MS if plan and previous_voiced and voiced else 0
+        start_ms = max(0, cursor_ms - overlap)
+        plan.append(
+            {
+                "beat": int(beat),
+                "old_start_ms": int(slot.get("start_ms") or beat * _BEAT_MS),
+                "new_start_ms": start_ms,
+                "new_duration_ms": duration_ms,
+            }
+        )
+        cursor_ms = max(
+            start_ms + _MIN_SCENE_MS + _VOICE_OVERLAP_MS,
+            start_ms + duration_ms,
+        )
+        previous_voiced = voiced
+    return plan, cursor_ms
+
+
+def _add_visual_windows(plan: list[dict[str, int]]) -> None:
+    for index, entry in enumerate(plan):
+        if index + 1 < len(plan):
+            next_start = plan[index + 1]["new_start_ms"]
+        else:
+            next_start = entry["new_start_ms"] + entry["new_duration_ms"]
+        entry["visual_duration_ms"] = max(
+            _MIN_SCENE_MS, next_start - entry["new_start_ms"]
+        )
+
+
+def _latest_content_end(
+    client: Client, track_ids: list[str], fallback: int
+) -> int:
+    ends: list[int] = []
+    for track_id in track_ids:
+        rows = (
+            client.table("clip")
+            .select(_SELECT_START_DURATION)
+            .eq("track_id", track_id)
+            .execute()
+            .data
+            or []
+        )
+        ends.extend(
+            int(row.get("start_ms") or 0) + int(row.get("duration_ms") or 0)
+            for row in rows
+        )
+    latest = max(ends, default=0)
+    return latest if latest > 0 else fallback
+
+
+def _stretch_music(client: Client, music_track_id: str | None, duration_ms: int) -> None:
+    if music_track_id:
+        client.table("clip").update(
+            {"start_ms": 0, "duration_ms": duration_ms}
+        ).eq("track_id", music_track_id).execute()
+
+
+def _resync_packed_timeline(
+    client: Client,
+    timeline_id: str,
+    plan: list[dict[str, int]],
+    cursor_ms: int,
+    aligned_tracks: dict[str, list[str]],
+    music_track_id: str | None,
+) -> dict:
+    track_ids = (
+        aligned_tracks["audio"]
+        + aligned_tracks["video"]
+        + aligned_tracks["caption"]
+    )
+    cursor_ms = _latest_content_end(client, track_ids, cursor_ms)
+    _stretch_music(client, music_track_id, cursor_ms)
+    client.table("timeline").update({"duration_ms": cursor_ms}).eq(
+        "id", timeline_id
+    ).execute()
+    return {
+        "updated_clips": 0,
+        "new_duration_ms": cursor_ms,
+        "beats": len(plan),
+        "skipped": "clips already packed; timeline duration re-synced",
+    }
+
+
+def _update_one_repack_clip(
+    client: Client,
+    track_id: str,
+    entry: dict[str, int],
+    duration_ms: int,
+) -> int:
+    patch = {"start_ms": entry["new_start_ms"], "duration_ms": duration_ms}
+    try:
+        result = (
+            client.table("clip")
+            .update(patch)
+            .eq("track_id", track_id)
+            .eq("beat_index", entry["beat"])
+            .execute()
+        )
+    except Exception:
+        result = (
+            client.table("clip")
+            .update(patch)
+            .eq("track_id", track_id)
+            .eq("start_ms", entry["old_start_ms"])
+            .execute()
+        )
+    if not (result.data or []):
+        result = (
+            client.table("clip")
+            .update(patch)
+            .eq("track_id", track_id)
+            .eq("start_ms", entry["old_start_ms"])
+            .execute()
+        )
+    return len(result.data or [])
+
+
+def _update_repack_clips(
+    client: Client,
+    aligned_tracks: dict[str, list[str]],
+    plan: list[dict[str, int]],
+) -> int:
+    updated = 0
+    for kind in ("video", "audio", "caption"):
+        for track_id in aligned_tracks[kind]:
+            for entry in plan:
+                duration_ms = (
+                    entry["new_duration_ms"]
+                    if kind == "audio"
+                    else entry["visual_duration_ms"]
+                )
+                updated += _update_one_repack_clip(
+                    client, track_id, entry, duration_ms
+                )
+    return updated
+
+
+def _cursor_with_subshots(
+    client: Client, video_track_ids: list[str], cursor_ms: int
+) -> int:
+    for track_id in video_track_ids:
+        rows = (
+            client.table("clip")
+            .select(_SELECT_START_DURATION)
+            .eq("track_id", track_id)
+            .is_("beat_index", "null")
+            .execute()
+            .data
+            or []
+        )
+        for row in rows:
+            cursor_ms = max(
+                cursor_ms,
+                int(row.get("start_ms") or 0)
+                + int(row.get("duration_ms") or 0),
+            )
+    return cursor_ms
+
+
+def _update_repack_slots(
+    client: Client, run_id: str, plan: list[dict[str, int]]
+) -> None:
+    for kind in ("visual", "voiceover", "caption"):
+        for entry in plan:
+            duration_ms = (
+                entry["new_duration_ms"]
+                if kind == "voiceover"
+                else entry["visual_duration_ms"]
+            )
+            client.table("slot").update(
+                {
+                    "start_ms": entry["new_start_ms"],
+                    "end_ms": entry["new_start_ms"] + duration_ms,
+                }
+            ).eq("run_id", run_id).eq("track", kind).eq(
+                "beat_index", entry["beat"]
+            ).execute()
+
+
+def _persist_repack_timeline(
+    client: Client,
+    timeline_id: str,
+    cursor_ms: int,
+    plan: list[dict[str, int]],
+) -> None:
+    markers = [
+        {
+            "id": f"beat-{entry['beat']}",
+            "timeMs": entry["new_start_ms"],
+            "beatIndex": entry["beat"],
+            "label": f"beat {entry['beat']}",
+        }
+        for entry in plan
+    ]
+    client.table("timeline").update({"duration_ms": cursor_ms}).eq(
+        "id", timeline_id
+    ).execute()
+    try:
+        client.table("timeline").update({"markers": markers}).eq(
+            "id", timeline_id
+        ).execute()
+    except Exception:
+        pass
+
+
 def repack_timeline_to_audio(client: Client, run_id: str) -> dict:
-    """Rescale beat-aligned clips so each beat fits its actual voiceover.
-
-    After voiceover_run uploads the real TTS audio (with measured
-    duration_ms on the artifact), this function:
-      1. Reads voiceover artifact durations beat by beat.
-      2. Computes a clamped per-beat duration and cumulative start_ms.
-      3. Updates video / audio / caption clips at each beat in place.
-      4. Updates timeline.duration_ms to the total.
-
-    Idempotent + opt-out:
-      * Sets ``timeline.attributes.audio_packed_at`` on first run; subsequent
-        calls noop so manual edits aren't clobbered.
-      * If a beat has no voiceover artifact, that beat keeps default
-        ``_REPACK_MIN_MS``.
-    """
+    """Repack all editor lanes onto measured voice timing without truncation."""
     timeline_rows = (
         client.table("timeline")
-        .select("id, duration_ms")
+        .select(_SELECT_ID_DURATION)
         .eq("run_id", run_id)
         .limit(1)
         .execute()
         .data
-    ) or []
-    if not timeline_rows:
-        return {"updated_clips": 0, "skipped": "no timeline"}
-    timeline = timeline_rows[0]
-    timeline_id = timeline["id"]
-
-    # Idempotency for CLIP repack: if any beat-aligned clip already has
-    # duration_ms != _BEAT_MS, the timeline was already repacked (or the
-    # user manually edited). We still want to fix timeline.duration_ms
-    # below if a previous run failed mid-way, so the skip is partial:
-    # clips stay as-is, but cursor_ms is recomputed and timeline updated.
-    sample = (
-        client.table("clip")
-        .select("start_ms, beat_index, track_id")
-        .in_("track_id", [
-            t["id"] for t in (
-                client.table("timeline_track")
-                .select("id, kind")
-                .eq("timeline_id", timeline_id)
-                .in_("kind", ["video", "audio", "caption"])
-                .execute()
-                .data
-            ) or []
-        ])
-        .limit(500)
-        .execute()
-        .data
-    ) or []
-    # A clip counts as "already packed" (or manually edited) only when its START
-    # is OFF the flat beat*_BEAT_MS grid — mirroring slots_already_packed below.
-    # BUG-2 fix: previously this keyed off duration_ms != _BEAT_MS, but
-    # sync_artifacts_to_clips writes the MEASURED voice duration (e.g. 9145ms)
-    # onto voice clips while their start_ms stays on the flat 0/1000/2000… grid.
-    # That false-positive made repack bail at the "already packed" guard before
-    # ever rewriting starts, so clips overlapped and captions crammed into the
-    # first few seconds. Beat 0 starts at 0 in BOTH packed and unpacked states,
-    # so only beats >= 1 are informative.
-    clips_already_packed = bool(
-        sample and any(
-            c.get("beat_index") is not None
-            and int(c.get("beat_index") or 0) >= 1
-            and int(c.get("start_ms") or 0) != int(c.get("beat_index") or 0) * _BEAT_MS
-            for c in sample
-        )
+        or []
     )
-
+    if not timeline_rows:
+        return {"updated_clips": 0, "skipped": _NO_TIMELINE}
+    timeline_id = timeline_rows[0]["id"]
+    clips_already_packed = _clips_are_packed(_repack_sample(client, timeline_id))
     tracks = (
         client.table("timeline_track")
-        .select("id, kind")
+        .select(_SELECT_ID_KIND)
         .eq("timeline_id", timeline_id)
         .execute()
         .data
-    ) or []
-    # Collect ALL beat-aligned tracks. There can be MORE THAN ONE video track
-    # (e.g. a main per-beat persona track + a scene-hold track left by a prior
-    # group_scenes_hold_image / re-produce cycle) and more than one audio lane
-    # ("Voice A", "Voice B"). Earlier this collapsed video/caption to a single
-    # last-wins track id, so when two video tracks existed repack packed only
-    # ONE — chosen by unordered row order — and left the MAIN beat clips at the
-    # 1000ms seed. The renderer composites every video track, so a half-packed
-    # main track produced a black tail. Collect ALL of them, like audio.
-    track_by_kind = {}
-    audio_track_ids = []
-    video_track_ids = []
-    caption_track_ids = []
-    for t in tracks:
-        kind = t["kind"]
-        if kind == "audio":
-            audio_track_ids.append(t["id"])
-        elif kind == "video":
-            video_track_ids.append(t["id"])
-        elif kind == "caption":
-            caption_track_ids.append(t["id"])
-        else:
-            track_by_kind[kind] = t["id"]
-
-    # Pull voiceover slots ordered by beat so we can rebuild durations.
-    vo_slots = (
+        or []
+    )
+    aligned_tracks, singleton_tracks = _partition_repack_tracks(tracks)
+    voice_slots = (
         client.table("slot")
         .select("beat_index, current_artifact_id, start_ms")
         .eq("run_id", run_id)
@@ -725,232 +930,34 @@ def repack_timeline_to_audio(client: Client, run_id: str) -> dict:
         .order("beat_index")
         .execute()
         .data
-    ) or []
-
-    if not vo_slots:
-        return {"updated_clips": 0, "skipped": "no voiceover slots"}
-
-    slots_already_packed = any(
-        int(s.get("start_ms") or 0) != int(s.get("beat_index") or 0) * _BEAT_MS
-        for s in vo_slots
-        if s.get("beat_index") is not None
+        or []
     )
-
-    art_ids = [s["current_artifact_id"] for s in vo_slots if s["current_artifact_id"]]
-    artifact_dur: dict[str, int] = {}
-    if art_ids:
-        rows = (
-            client.table("artifact")
-            .select("id, duration_ms")
-            .in_("id", art_ids)
-            .execute()
-            .data
-        ) or []
-        artifact_dur = {r["id"]: (r.get("duration_ms") or 0) for r in rows}
-
-    # EDIT-WIRE-3: fetch scene_type per beat from audio clip attributes
-    beat_scene: dict[int, str] = {}
-    if audio_track_ids:
-        _scene_rows = (
-            client.table("clip")
-            .select("beat_index, attributes")
-            .in_("track_id", audio_track_ids)
-            .not_.is_("beat_index", "null")
-            .execute()
-            .data
-        ) or []
-        for _c in _scene_rows:
-            _bi = _c.get("beat_index")
-            if _bi is not None:
-                beat_scene[int(_bi)] = str(
-                    (_c.get("attributes") or {}).get("scene_type") or ""
-                ).lower()
-
-    # Build per-beat plan. Voices OVERLAP: each beat starts _VOICE_OVERLAP_MS
-    # before the previous one ends (theatre interjection), but only when both
-    # neighbours carry real voice. ``new_duration_ms`` is the AUDIO length (the
-    # voice line always plays in full); the on-screen ``visual_duration_ms`` is
-    # computed below so visuals + captions stay contiguous (cut at the next beat)
-    # even though the audio bleeds across the boundary.
-    cursor_ms = 0
-    plan: list[dict[str, int]] = []
-    prev_voiced = False
-    for slot in vo_slots:
-        beat = slot.get("beat_index")
-        if beat is None:
-            continue
-        art_id = slot.get("current_artifact_id")
-        audio_ms = artifact_dur.get(art_id, 0) if art_id else 0
-        voiced = audio_ms > 0
-        scene_t = beat_scene.get(int(beat), "")
-        new_dur = _beat_duration_ms(audio_ms) + _scene_breath_ms(scene_t, voiced)
-        overlap = _VOICE_OVERLAP_MS if (plan and prev_voiced and voiced) else 0
-        start = max(0, cursor_ms - overlap)
-        plan.append({
-            "beat": int(beat),
-            "old_start_ms": int(slot.get("start_ms") or beat * _BEAT_MS),
-            "new_start_ms": start,
-            "new_duration_ms": new_dur,
-        })
-        # Floor the beat advance to ensure image window (advance minus next overlap) stays >= _MIN_SCENE_MS
-        cursor_ms = max(start + _MIN_SCENE_MS + _VOICE_OVERLAP_MS, start + new_dur)
-        prev_voiced = voiced
-
+    if not voice_slots:
+        return {"updated_clips": 0, "skipped": "no voiceover slots"}
+    slots_already_packed = _slots_are_packed(voice_slots)
+    durations = _load_repack_durations(client, voice_slots)
+    scene_types = _load_scene_types(client, aligned_tracks["audio"])
+    plan, cursor_ms = _build_repack_plan(voice_slots, durations, scene_types)
     if not plan:
         return {"updated_clips": 0, "skipped": "no beats"}
-
-    # Visual + caption duration = until the NEXT beat starts (contiguous: no
-    # double image / double caption on screen even though the voices overlap).
-    # The last beat keeps its full audio length.
-    for i, entry in enumerate(plan):
-        next_start = plan[i + 1]["new_start_ms"] if i + 1 < len(plan) else entry["new_start_ms"] + entry["new_duration_ms"]
-        entry["visual_duration_ms"] = max(_MIN_SCENE_MS, next_start - entry["new_start_ms"])
-
-    # If clips were already packed, recompute cursor_ms from existing clip
-    # durations (not from voiceover slots) so timeline.duration_ms below
-    # matches the actual on-disk state.
+    _add_visual_windows(plan)
+    music_track_id = singleton_tracks.get("music")
     if clips_already_packed and slots_already_packed:
-        # Reel length = the LATEST content END across beat-aligned tracks, NOT the
-        # SUM of audio-lane durations. Voice A and Voice B play in PARALLEL (J/L
-        # zig-zag), so summing them double-counts and inflates the timeline, which
-        # then stretches the music over a black/music-only TAIL (napkin I2 = no
-        # blackout). Take max(start+duration) across video / audio lanes / caption.
-        end_track_ids = list(audio_track_ids) + list(video_track_ids) + list(caption_track_ids)
-        ends = []
-        for tid in end_track_ids:
-            rows = (
-                client.table("clip")
-                .select("start_ms, duration_ms")
-                .eq("track_id", tid)
-                .execute()
-                .data
-            ) or []
-            ends.extend(int(c.get("start_ms") or 0) + int(c.get("duration_ms") or 0) for c in rows)
-        if ends and max(ends) > 0:
-            cursor_ms = max(ends)
-        # Stretch music + update timeline.duration_ms below, but skip the
-        # clip/slot rewrites since they're already correct.
-        music_tid = track_by_kind.get("music")
-        if music_tid:
-            client.table("clip").update({
-                "start_ms": 0,
-                "duration_ms": cursor_ms,
-            }).eq("track_id", music_tid).execute()
-        client.table("timeline").update({
-            "duration_ms": cursor_ms,
-        }).eq("id", timeline_id).execute()
-        return {
-            "updated_clips": 0,
-            "new_duration_ms": cursor_ms,
-            "beats": len(plan),
-            "skipped": "clips already packed; timeline duration re-synced",
-        }
-
-    # Update clips for each beat-aligned kind. Prefer explicit beat_index; fall
-    # back to old_start_ms for deployments that have not applied 0012 yet.
-    # Every beat-aligned kind is updated across ALL its tracks (there may be
-    # multiple video tracks and multiple audio lanes) so no main track is left
-    # at the 1000ms seed when a duplicate/scene-hold track is present.
-    track_ids_by_kind = {
-        "video": video_track_ids,
-        "audio": audio_track_ids,
-        "caption": caption_track_ids,
-    }
-    updated_clips = 0
-    for kind in ("video", "audio", "caption"):
-        track_ids = track_ids_by_kind[kind]
-
-        for tid in track_ids:
-            for entry in plan:
-                # Audio plays its FULL voice line (overlapping into the next beat);
-                # video + caption stay contiguous so only the sound overlaps.
-                dur = entry["new_duration_ms"] if kind == "audio" else entry.get("visual_duration_ms", entry["new_duration_ms"])
-                patch = {
-                    "start_ms": entry["new_start_ms"],
-                    "duration_ms": dur,
-                }
-                try:
-                    res = (
-                        client.table("clip")
-                        .update(patch)
-                        .eq("track_id", tid)
-                        .eq("beat_index", entry["beat"])
-                        .execute()
-                    )
-                except Exception:
-                    res = (
-                        client.table("clip")
-                        .update(patch)
-                        .eq("track_id", tid)
-                        .eq("start_ms", entry["old_start_ms"])
-                        .execute()
-                    )
-                if not (res.data or []):
-                    res = (
-                        client.table("clip")
-                        .update(patch)
-                        .eq("track_id", tid)
-                        .eq("start_ms", entry["old_start_ms"])
-                        .execute()
-                    )
-                updated_clips += len(res.data or [])
-
-    # U-M1-EDIT-PACING: account for beat_index=NULL subshots (created by
-    # split_long_beats_into_subshots) whose end may exceed the plan cursor_ms,
-    # causing the music and timeline.duration_ms to be too short (orphan tail).
-    for vid_tid in video_track_ids:
-        _subshot_rows = (
-            client.table("clip")
-            .select("start_ms, duration_ms")
-            .eq("track_id", vid_tid)
-            .is_("beat_index", "null")
-            .execute()
-            .data or []
+        return _resync_packed_timeline(
+            client,
+            timeline_id,
+            plan,
+            cursor_ms,
+            aligned_tracks,
+            music_track_id,
         )
-        for ss in _subshot_rows:
-            ss_end = int(ss.get("start_ms") or 0) + int(ss.get("duration_ms") or 0)
-            if ss_end > cursor_ms:
-                cursor_ms = ss_end
-
-    # Update voiceover/visual/caption slot start_ms/end_ms so future syncs
-    # still match (slot.start_ms is the canonical lookup key for clip sync).
-    for kind in ("visual", "voiceover", "caption"):
-        for entry in plan:
-            dur = entry["new_duration_ms"] if kind == "voiceover" else entry.get("visual_duration_ms", entry["new_duration_ms"])
-            client.table("slot").update({
-                "start_ms": entry["new_start_ms"],
-                "end_ms": entry["new_start_ms"] + dur,
-            }).eq("run_id", run_id).eq("track", kind).eq("beat_index", entry["beat"]).execute()
-
-    # Stretch the music clip (single span) to the new total duration.
-    music_tid = track_by_kind.get("music")
-    if music_tid:
-        client.table("clip").update({
-            "start_ms": 0,
-            "duration_ms": cursor_ms,
-        }).eq("track_id", music_tid).execute()
-
-    # Persist new total duration + refresh markers so the editor's beat
-    # ruler matches the new layout. Split into two updates: an earlier
-    # combined update was silently failing (likely the "now()" string in
-    # the timestamp column), and we *must* land duration_ms or the editor
-    # truncates the last clip.
-    markers = [
-        {"id": f"beat-{p['beat']}", "timeMs": p["new_start_ms"], "beatIndex": p["beat"], "label": f"beat {p['beat']}"}
-        for p in plan
-    ]
-    client.table("timeline").update({
-        "duration_ms": cursor_ms,
-    }).eq("id", timeline_id).execute()
-    try:
-        client.table("timeline").update({
-            "markers": markers,
-        }).eq("id", timeline_id).execute()
-    except Exception:
-        # Markers are nice-to-have; if PostgREST rejects the JSONB payload
-        # for any reason, keep the duration_ms update we just landed.
-        pass
-
+    updated_clips = _update_repack_clips(client, aligned_tracks, plan)
+    cursor_ms = _cursor_with_subshots(
+        client, aligned_tracks["video"], cursor_ms
+    )
+    _update_repack_slots(client, run_id, plan)
+    _stretch_music(client, music_track_id, cursor_ms)
+    _persist_repack_timeline(client, timeline_id, cursor_ms, plan)
     return {
         "updated_clips": updated_clips,
         "new_duration_ms": cursor_ms,
@@ -962,36 +969,95 @@ _SUBBEAT_MAX_MS = 3500  # mirror of athena SUBBEAT_MAX_MS (founder 3초/장 규�
 _SUBBEAT_MAX_COUNT = 2  # cap sub-beat count to limit API spend
 
 
-def sync_video_positions_from_markers(client: Client, run_id: str) -> dict:
-    """Align video clip start_ms/duration_ms to variable beat markers and backfill sub_images.
+def _beat_positions_from_markers(markers: list[dict]) -> dict[int, dict[str, int]]:
+    valid = [
+        marker
+        for marker in markers
+        if marker.get("beatIndex") is not None
+        and marker.get("durationMs") is not None
+    ]
+    sorted_markers = sorted(valid, key=lambda marker: marker.get("beatIndex") or 0)
+    positions: dict[int, dict[str, int]] = {}
+    for index, marker in enumerate(sorted_markers):
+        start_ms = int(marker.get("timeMs") or 0)
+        if index + 1 < len(sorted_markers):
+            next_start_ms = int(sorted_markers[index + 1].get("timeMs") or 0)
+        else:
+            next_start_ms = start_ms + int(marker["durationMs"])
+        positions[int(marker["beatIndex"])] = {
+            "start_ms": start_ms,
+            "visual_duration_ms": max(50, next_start_ms - start_ms),
+        }
+    return positions
 
-    Called after patch_beat_markers_from_tts so video clips follow actual TTS-driven
-    beat durations rather than the flat i*BEAT_MS grid. For long beats that gain
-    duration_ms > _SUBBEAT_MAX_MS without sub_images, the primary artifact URL is
-    repeated N times so the renderer can apply distinct Ken-Burns paths. Idempotent.
-    """
-    tl = client.table("timeline").select("id, markers").eq("run_id", run_id).limit(1).execute().data
+
+def _artifact_storage_by_id(client: Client, clips: list[dict]) -> dict[str, str]:
+    artifact_ids = [clip["artifact_id"] for clip in clips if clip.get("artifact_id")]
+    if not artifact_ids:
+        return {}
+    rows = (
+        client.table("artifact")
+        .select("id, storage_key")
+        .in_("id", artifact_ids)
+        .execute()
+        .data
+        or []
+    )
+    return {row["id"]: (row.get("storage_key") or "") for row in rows}
+
+
+def _video_position_patch(
+    clip: dict,
+    positions: dict[int, dict[str, int]],
+    storage_by_id: dict[str, str],
+) -> dict[str, Any] | None:
+    beat = clip.get("beat_index")
+    if beat is None:
+        return None
+    position = positions.get(int(beat))
+    if not position:
+        return None
+    new_start = position["start_ms"]
+    new_duration = position["visual_duration_ms"]
+    patch: dict[str, Any] = {"updated_at": _DATABASE_NOW}
+    if (
+        int(clip.get("start_ms") or 0) != new_start
+        or int(clip.get("duration_ms") or 0) != new_duration
+    ):
+        patch.update({"start_ms": new_start, "duration_ms": new_duration})
+    attributes = dict(clip.get("attributes") or {})
+    sub_images = attributes.get("sub_images") or []
+    needed = min(
+        _SUBBEAT_MAX_COUNT,
+        max(1, (new_duration + _SUBBEAT_MAX_MS - 1) // _SUBBEAT_MAX_MS),
+    )
+    should_extend = (
+        new_duration > _SUBBEAT_MAX_MS
+        and len(sub_images) < needed
+        and bool(clip.get("artifact_id"))
+    )
+    if should_extend:
+        storage_key = storage_by_id.get(clip["artifact_id"] or "")
+        if storage_key:
+            attributes["sub_images"] = (
+                list(sub_images) + [storage_key] * (needed - len(sub_images))
+            )[:needed]
+            patch["attributes"] = attributes
+    return patch if len(patch) > 1 else None
+
+
+def sync_video_positions_from_markers(client: Client, run_id: str) -> dict:
+    """Align video clips to markers and backfill long-beat sub-images."""
+    tl = client.table("timeline").select(_SELECT_ID_MARKERS).eq("run_id", run_id).limit(1).execute().data
     if not tl:
         return {"synced": 0, "skipped": "no_timeline"}
     timeline = tl[0]
     markers = list(timeline.get("markers") or [])
     if not markers:
         return {"synced": 0, "skipped": "no_markers"}
-
-    valid = [m for m in markers if m.get("beatIndex") is not None and m.get("durationMs") is not None]
-    if not valid:
+    positions = _beat_positions_from_markers(markers)
+    if not positions:
         return {"synced": 0, "skipped": "no_valid_markers"}
-
-    sorted_m = sorted(valid, key=lambda m: m.get("beatIndex") or 0)
-    beat_positions: dict[int, dict[str, int]] = {}
-    for idx, m in enumerate(sorted_m):
-        bi = int(m["beatIndex"])
-        time_ms = int(m.get("timeMs") or 0)
-        dur_ms = int(m.get("durationMs") or 0)
-        next_time_ms = int(sorted_m[idx + 1].get("timeMs") or 0) if idx + 1 < len(sorted_m) else time_ms + dur_ms
-        visual_dur_ms = max(50, next_time_ms - time_ms)
-        beat_positions[bi] = {"start_ms": time_ms, "visual_duration_ms": visual_dur_ms}
-
     video_tracks = (
         client.table("timeline_track")
         .select("id")
@@ -1002,7 +1068,6 @@ def sync_video_positions_from_markers(client: Client, run_id: str) -> dict:
     )
     if not video_tracks:
         return {"synced": 0, "skipped": "no_video_tracks"}
-
     track_ids = [t["id"] for t in video_tracks]
     video_clips = (
         client.table("clip")
@@ -1012,183 +1077,144 @@ def sync_video_positions_from_markers(client: Client, run_id: str) -> dict:
         .execute()
         .data or []
     )
-
-    artifact_ids = [c["artifact_id"] for c in video_clips if c.get("artifact_id")]
-    art_url_by_id: dict[str, str] = {}
-    if artifact_ids:
-        arts = (
-            client.table("artifact")
-            .select("id, storage_key")
-            .in_("id", artifact_ids)
-            .execute()
-            .data or []
-        )
-        # storage_key is used as public_url key; store raw key for caller to resolve
-        art_url_by_id = {a["id"]: (a.get("storage_key") or "") for a in arts}
-
+    storage_by_id = _artifact_storage_by_id(client, video_clips)
     synced = 0
     for clip in video_clips:
-        bi = clip.get("beat_index")
-        if bi is None:
-            continue
-        pos = beat_positions.get(int(bi))
-        if not pos:
-            continue
-        new_start = pos["start_ms"]
-        new_dur = pos["visual_duration_ms"]
-        attrs = dict(clip.get("attributes") or {})
-
-        patch: dict[str, Any] = {"updated_at": "now()"}
-        changed = False
-
-        if int(clip.get("start_ms") or 0) != new_start or int(clip.get("duration_ms") or 0) != new_dur:
-            patch["start_ms"] = new_start
-            patch["duration_ms"] = new_dur
-            changed = True
-
-        # Backfill sub_images for long beats that now have duration_ms > _SUBBEAT_MAX_MS
-        # but no sub_images: repeat the primary artifact URL N times so the renderer
-        # can show distinct Ken-Burns paths per sub-window even with the same image.
-        existing_sub_images = attrs.get("sub_images") or []
-        n_needed = min(_SUBBEAT_MAX_COUNT, max(1, (new_dur + _SUBBEAT_MAX_MS - 1) // _SUBBEAT_MAX_MS))
-        if new_dur > _SUBBEAT_MAX_MS and len(existing_sub_images) < n_needed and clip.get("artifact_id"):
-            sk = art_url_by_id.get(clip["artifact_id"] or "")
-            if sk:
-                # Extend sub_images to n_needed entries (repeat primary key as placeholder)
-                extended = list(existing_sub_images) + [sk] * (n_needed - len(existing_sub_images))
-                attrs["sub_images"] = extended[:n_needed]
-                patch["attributes"] = attrs
-                changed = True
-
-        if changed:
+        patch = _video_position_patch(clip, positions, storage_by_id)
+        if patch:
             client.table("clip").update(patch).eq("id", clip["id"]).execute()
             synced += 1
-
     return {"synced": synced, "total": len(video_clips)}
 
 
-def extend_music_to_cover(client: Client, run_id: str) -> dict:
-    """음악 트랙이 영상 끝보다 짧으면 같은 애셋을 루프(연속 클론)로 채운다.
+def _append_music_loops(client: Client, last: dict, video_end: int) -> tuple[int, int]:
+    music_end = int(last["start_ms"] or 0) + int(last["duration_ms"] or 0)
+    unit_ms = max(1000, int(last["duration_ms"] or 0))
+    looped = 0
+    while video_end - music_end > 500 and looped < 8:
+        duration_ms = min(unit_ms, video_end - music_end)
+        client.table("clip").insert(
+            {
+                "track_id": last["track_id"],
+                "artifact_id": last["artifact_id"],
+                "start_ms": music_end,
+                "duration_ms": duration_ms,
+                "in_ms": 0,
+                "beat_index": None,
+                "transforms": last.get("transforms")
+                or {"x": 0, "y": 0, "scale": 1, "rotation": 0, "opacity": 1},
+                "effects": last.get("effects") or [],
+                "attributes": {"looped": True, "loop_of": last["id"]},
+            }
+        ).execute()
+        music_end += duration_ms
+        looped += 1
+    return looped, music_end
 
-    2026-07-10 실사고: 음악 애셋(32.0s)이 패딩 비트 체인(38.7s)보다 짧아 마지막
-    6.7초가 무음악 — 렌더 게이트 G3가 차단한 실결함. 마지막 조각은 남는 길이로
-    클램프. Idempotent(이미 커버돼 있으면 no-op). 클론엔 attributes.looped 표기.
-    """
+
+def extend_music_to_cover(client: Client, run_id: str) -> dict:
+    """Loop the final music asset until it covers the video lane."""
     tl = client.table("timeline").select("id").eq("run_id", run_id).limit(1).execute().data
     if not tl:
         return {"looped": 0, "skipped": "no_timeline"}
     timeline_id = tl[0]["id"]
-    tracks = (client.table("timeline_track").select("id, kind")
+    tracks = (client.table("timeline_track").select(_SELECT_ID_KIND)
               .eq("timeline_id", timeline_id).execute().data or [])
     video_ids = [t["id"] for t in tracks if t["kind"] == "video"]
     music_ids = [t["id"] for t in tracks if t["kind"] == "music"]
     if not video_ids or not music_ids:
         return {"looped": 0, "skipped": "no_tracks"}
-    v_clips = (client.table("clip").select("start_ms, duration_ms")
+    v_clips = (client.table("clip").select(_SELECT_START_DURATION)
                .in_("track_id", video_ids).execute().data or [])
     video_end = max((int(c["start_ms"] or 0) + int(c["duration_ms"] or 0) for c in v_clips), default=0)
     m_clips = (client.table("clip").select("id, track_id, artifact_id, start_ms, duration_ms, transforms, effects")
                .in_("track_id", music_ids).order("start_ms").execute().data or [])
     if not m_clips or not video_end:
         return {"looped": 0, "skipped": "no_music_or_video"}
-    last = m_clips[-1]
-    music_end = int(last["start_ms"] or 0) + int(last["duration_ms"] or 0)
-    unit = max(1000, int(last["duration_ms"] or 0))
-    looped = 0
-    while video_end - music_end > 500 and looped < 8:
-        dur = min(unit, video_end - music_end)
-        client.table("clip").insert({
-            "track_id": last["track_id"], "artifact_id": last["artifact_id"],
-            "start_ms": music_end, "duration_ms": dur, "in_ms": 0, "beat_index": None,
-            "transforms": last.get("transforms") or {"x": 0, "y": 0, "scale": 1, "rotation": 0, "opacity": 1},
-            "effects": last.get("effects") or [],
-            "attributes": {"looped": True, "loop_of": last["id"]},
-        }).execute()
-        music_end += dur
-        looped += 1
+    looped, music_end = _append_music_loops(client, m_clips[-1], video_end)
     return {"looped": looped, "video_end": video_end, "music_end": music_end}
 
 
-def sync_audio_positions_from_markers(client: Client, run_id: str) -> dict:
-    """보이스(audio)·SFX 클립을 caption/video와 같은 가변 비트 마커에 정렬.
+def _audio_position_patch(
+    clip: dict, positions: dict[int, dict[str, int]]
+) -> dict[str, Any] | None:
+    beat = int(clip["beat_index"])
+    position = positions.get(beat)
+    if not position:
+        return None
+    start_ms = position["start_ms"]
+    duration_ms = int(clip.get("duration_ms") or 0)
+    window_ms = position["visual_duration_ms"]
+    new_duration = min(duration_ms, window_ms) if duration_ms > 0 else window_ms
+    if int(clip.get("start_ms") or 0) == start_ms and duration_ms == new_duration:
+        return None
+    return {
+        "start_ms": start_ms,
+        "duration_ms": new_duration,
+        "updated_at": _DATABASE_NOW,
+    }
 
-    2026-07-10 desync 실사고: patch_beat_markers_from_tts(보이스 실길이+300ms 숨)가
-    caption·video만 재배치하고 audio는 조립 체인(실길이 연쇄)에 남겨, 매 비트
-    +300~470ms 드리프트가 16비트에 6.7초 누적 — "말은 먼저 끝나고 자막·이미지가
-    따로"의 근본. 세 트랙이 단일 시간 체계(마커)를 공유해야 한다. Idempotent.
-    보이스 duration은 artifact 실길이를 유지(마커 창 초과 시에만 창으로 클램프) —
-    비트 끝 300ms는 설계된 숨이 된다.
-    """
-    tl = client.table("timeline").select("id, markers").eq("run_id", run_id).limit(1).execute().data
+
+def sync_audio_positions_from_markers(client: Client, run_id: str) -> dict:
+    """Align voice and SFX clips to the same marker clock as video."""
+    tl = client.table("timeline").select(_SELECT_ID_MARKERS).eq("run_id", run_id).limit(1).execute().data
     if not tl:
         return {"synced": 0, "skipped": "no_timeline"}
     timeline = tl[0]
-    markers = [m for m in (timeline.get("markers") or [])
-               if m.get("beatIndex") is not None and m.get("durationMs") is not None]
-    if not markers:
+    positions = _beat_positions_from_markers(list(timeline.get("markers") or []))
+    if not positions:
         return {"synced": 0, "skipped": "no_markers"}
-    sorted_m = sorted(markers, key=lambda m: m.get("beatIndex") or 0)
-    beat_start: dict[int, int] = {}
-    beat_window: dict[int, int] = {}
-    for idx, m in enumerate(sorted_m):
-        bi = int(m["beatIndex"])
-        t0 = int(m.get("timeMs") or 0)
-        t1 = int(sorted_m[idx + 1].get("timeMs") or 0) if idx + 1 < len(sorted_m) else t0 + int(m["durationMs"])
-        beat_start[bi] = t0
-        beat_window[bi] = max(50, t1 - t0)
-
-    tracks = (client.table("timeline_track").select("id, kind")
+    tracks = (client.table("timeline_track").select(_SELECT_ID_KIND)
               .eq("timeline_id", timeline["id"]).in_("kind", ["audio", "sfx"]).execute().data or [])
     if not tracks:
         return {"synced": 0, "skipped": "no_audio_tracks"}
     synced = 0
-    for t in tracks:
+    for track in tracks:
         clips = (client.table("clip").select("id, beat_index, start_ms, duration_ms")
-                 .eq("track_id", t["id"]).not_.is_("beat_index", "null").execute().data or [])
+                 .eq("track_id", track["id"]).not_.is_("beat_index", "null").execute().data or [])
         for clip in clips:
-            bi = int(clip["beat_index"])
-            if bi not in beat_start:
-                continue
-            new_start = beat_start[bi]
-            dur = int(clip.get("duration_ms") or 0)
-            # 보이스/SFX 실길이 유지 — 창 초과 시에만 클램프(다음 비트 침범 방지)
-            new_dur = min(dur, beat_window[bi]) if dur > 0 else beat_window[bi]
-            if int(clip.get("start_ms") or 0) == new_start and dur == new_dur:
-                continue
-            client.table("clip").update({
-                "start_ms": new_start, "duration_ms": new_dur, "updated_at": "now()",
-            }).eq("id", clip["id"]).execute()
-            synced += 1
+            patch = _audio_position_patch(clip, positions)
+            if patch:
+                client.table("clip").update(patch).eq("id", clip["id"]).execute()
+                synced += 1
     return {"synced": synced}
 
 
-def sync_caption_positions_from_markers(client: Client, run_id: str) -> dict:
-    """Align caption clip start_ms/duration_ms to variable beat markers.
+def _visual_position_patch(
+    clip: dict, positions: dict[int, dict[str, int]]
+) -> dict[str, Any] | None:
+    beat = clip.get("beat_index")
+    if beat is None:
+        return None
+    position = positions.get(int(beat))
+    if not position:
+        return None
+    start_ms = position["start_ms"]
+    duration_ms = position["visual_duration_ms"]
+    if (
+        int(clip.get("start_ms") or 0) == start_ms
+        and int(clip.get("duration_ms") or 0) == duration_ms
+    ):
+        return None
+    return {
+        "start_ms": start_ms,
+        "duration_ms": duration_ms,
+        "updated_at": _DATABASE_NOW,
+    }
 
-    Called after patch_beat_markers_from_tts so caption clips follow actual TTS
-    durations instead of the flat i*BEAT_MS grid. Idempotent.
-    """
-    tl = client.table("timeline").select("id, markers").eq("run_id", run_id).limit(1).execute().data
+
+def sync_caption_positions_from_markers(client: Client, run_id: str) -> dict:
+    """Align caption clips to variable beat markers."""
+    tl = client.table("timeline").select(_SELECT_ID_MARKERS).eq("run_id", run_id).limit(1).execute().data
     if not tl:
         return {"synced": 0, "skipped": "no_timeline"}
     timeline = tl[0]
     markers = list(timeline.get("markers") or [])
     if not markers:
         return {"synced": 0, "skipped": "no_markers"}
-
-    valid = [m for m in markers if m.get("beatIndex") is not None and m.get("durationMs") is not None]
-    if not valid:
+    positions = _beat_positions_from_markers(markers)
+    if not positions:
         return {"synced": 0, "skipped": "no_valid_markers"}
-
-    sorted_m = sorted(valid, key=lambda m: m.get("beatIndex") or 0)
-    beat_positions: dict[int, dict[str, int]] = {}
-    for idx, m in enumerate(sorted_m):
-        bi = int(m["beatIndex"])
-        time_ms = int(m.get("timeMs") or 0)
-        next_time_ms = int(sorted_m[idx + 1].get("timeMs") or 0) if idx + 1 < len(sorted_m) else time_ms + int(m["durationMs"])
-        visual_dur_ms = max(50, next_time_ms - time_ms)
-        beat_positions[bi] = {"start_ms": time_ms, "visual_duration_ms": visual_dur_ms}
-
     caption_tracks = (
         client.table("timeline_track")
         .select("id")
@@ -1212,49 +1238,83 @@ def sync_caption_positions_from_markers(client: Client, run_id: str) -> dict:
 
     synced = 0
     for clip in caption_clips:
-        bi = clip.get("beat_index")
-        if bi is None:
-            continue
-        pos = beat_positions.get(int(bi))
-        if not pos:
-            continue
-        new_start = pos["start_ms"]
-        new_dur = pos["visual_duration_ms"]
-        if int(clip.get("start_ms") or 0) == new_start and int(clip.get("duration_ms") or 0) == new_dur:
-            continue
-        client.table("clip").update({
-            "start_ms": new_start,
-            "duration_ms": new_dur,
-            "updated_at": "now()",
-        }).eq("id", clip["id"]).execute()
-        synced += 1
-
+        patch = _visual_position_patch(clip, positions)
+        if patch:
+            client.table("clip").update(patch).eq("id", clip["id"]).execute()
+            synced += 1
     return {"synced": synced, "total": len(caption_clips)}
 
 
+def _video_clips_by_beat(clips: list[dict]) -> dict[int, dict]:
+    return {
+        int(clip["beat_index"]): clip
+        for clip in clips
+        if clip.get("beat_index") is not None and clip.get("artifact_id")
+    }
+
+
+def _scene_entries(
+    clips_by_beat: dict[int, dict], persona_by_artifact: dict[str, str]
+) -> list[tuple[int, str, str]]:
+    entries: list[tuple[int, str, str]] = []
+    for beat in sorted(clips_by_beat):
+        image_id = clips_by_beat[beat]["artifact_id"]
+        persona = persona_by_artifact.get(image_id, "")
+        entries.append((beat, persona if persona else f"_solo_{beat}", image_id))
+    return entries
+
+
+def _group_consecutive_scenes(
+    entries: list[tuple[int, str, str]],
+) -> list[list[tuple[int, str, str]]]:
+    scenes = [[entries[0]]]
+    for entry in entries[1:]:
+        previous_beat, previous_key, _ = scenes[-1][-1]
+        same_scene = (
+            entry[0] == previous_beat + 1
+            and entry[1] == previous_key
+            and not entry[1].startswith("_solo_")
+        )
+        if same_scene:
+            scenes[-1].append(entry)
+        else:
+            scenes.append([entry])
+    return scenes
+
+
+def _hold_scene_followers(
+    client: Client,
+    scenes: list[list[tuple[int, str, str]]],
+    clips_by_beat: dict[int, dict],
+) -> tuple[int, int]:
+    held_beats = 0
+    multi_beat_scenes = 0
+    for scene in scenes:
+        if len(scene) < 2:
+            continue
+        multi_beat_scenes += 1
+        representative_image = scene[0][2]
+        for beat, _key, _image in scene[1:]:
+            clip = clips_by_beat[beat]
+            if clip.get("artifact_id") == representative_image:
+                continue
+            client.table("clip").update(
+                {
+                    "artifact_id": representative_image,
+                    "updated_at": _DATABASE_NOW,
+                }
+            ).eq("id", clip["id"]).execute()
+            held_beats += 1
+    return multi_beat_scenes, held_beats
+
+
 def group_scenes_hold_image(client: Client, run_id: str) -> dict:
-    """NAPKIN I1 (IMAGE = SCENE): consecutive beats by the SAME persona are ONE
-    SCENE → the on-screen IMAGE HOLDS across them. The video lane cuts only on a
-    SCENE change (persona / visual change), NEVER per beat — decoupled from the
-    finer, overlapping voice TURNS (I3 / I4 J-L cut, already handled by repack).
-
-    Mechanism: each beat's persona + rendered image come from its VIDEO CLIP's
-    artifact (``clip.artifact_id`` → ``attributes.persona_id``) — the rendered
-    domain, so the hold matches exactly what the renderer shows. Consecutive
-    beats sharing a non-empty persona are merged into a scene whose FIRST image
-    is pointed to by every beat in it, so frames sampled across the scene show
-    no cut. Beats with no persona (product / demo / proof B-roll, single-narrator)
-    get a unique key and are NEVER merged, so a strict-alternation script is a
-    safe no-op.
-
-    Idempotent: re-running re-derives personas from the (unchanged) first beat of
-    each scene and re-points the followers at the same image.
-    """
+    """Hold one rendered image across consecutive beats of one persona."""
     timeline = (
         client.table("timeline").select("id").eq("run_id", run_id).limit(1).execute().data
     ) or []
     if not timeline:
-        return {"scenes": 0, "skipped": "no timeline"}
+        return {"scenes": 0, "skipped": _NO_TIMELINE}
     timeline_id = timeline[0]["id"]
 
     video_tracks = (
@@ -1266,11 +1326,9 @@ def group_scenes_hold_image(client: Client, run_id: str) -> dict:
         .data
     ) or []
     if not video_tracks:
-        return {"scenes": 0, "skipped": "no video track"}
+        return {"scenes": 0, "skipped": _NO_VIDEO_TRACK}
     video_track_id = video_tracks[0]["id"]
 
-    # Per-beat rendered image = the VIDEO clip's artifact_id. persona_id rides
-    # that artifact's attributes. Clips are the rendered source of truth.
     clips = (
         client.table("clip")
         .select("id, beat_index, artifact_id")
@@ -1279,64 +1337,29 @@ def group_scenes_hold_image(client: Client, run_id: str) -> dict:
         .execute()
         .data
     ) or []
-    clip_by_beat = {
-        int(c["beat_index"]): c
-        for c in clips
-        if c.get("beat_index") is not None and c.get("artifact_id")
-    }
-    if not clip_by_beat:
+    clips_by_beat = _video_clips_by_beat(clips)
+    if not clips_by_beat:
         return {"scenes": 0, "skipped": "no video clips with images"}
-
     art_rows = (
         client.table("artifact")
         .select("id, attributes")
-        .in_("id", list({c["artifact_id"] for c in clip_by_beat.values()}))
+        .in_("id", list({clip["artifact_id"] for clip in clips_by_beat.values()}))
         .execute()
         .data
     ) or []
-    persona_by_art = {
-        r["id"]: str((r.get("attributes") or {}).get("persona_id") or "").strip()
-        for r in art_rows
+    persona_by_artifact = {
+        row["id"]: str(
+            (row.get("attributes") or {}).get("persona_id") or ""
+        ).strip()
+        for row in art_rows
     }
-
-    # Ordered (beat, scene_key, image). Empty persona → unique key (never merges).
-    beats = sorted(clip_by_beat.keys())
-    keyed = []
-    for b in beats:
-        img = clip_by_beat[b]["artifact_id"]
-        persona = persona_by_art.get(img, "")
-        keyed.append((b, persona if persona else f"_solo_{b}", img))
-
-    # Group beats that are TRULY consecutive (beat_index n, n+1) AND share the
-    # same non-solo persona. A missing/empty beat in between breaks the scene.
-    scenes: list[list[tuple]] = [[keyed[0]]]
-    for entry in keyed[1:]:
-        prev_beat, prev_key = scenes[-1][-1][0], scenes[-1][-1][1]
-        if (
-            entry[0] == prev_beat + 1
-            and entry[1] == prev_key
-            and not entry[1].startswith("_solo_")
-        ):
-            scenes[-1].append(entry)
-        else:
-            scenes.append([entry])
-
-    held_beats = 0
-    multi_beat_scenes = 0
-    for scene in scenes:
-        if len(scene) < 2:
-            continue
-        multi_beat_scenes += 1
-        rep_img = scene[0][2]  # the scene's first rendered image holds across it
-        for (b, _key, _img) in scene[1:]:
-            clip = clip_by_beat.get(b)
-            if not clip or clip.get("artifact_id") == rep_img:
-                continue
-            client.table("clip").update(
-                {"artifact_id": rep_img, "updated_at": "now()"}
-            ).eq("id", clip["id"]).execute()
-            held_beats += 1
-
+    beats = sorted(clips_by_beat)
+    scenes = _group_consecutive_scenes(
+        _scene_entries(clips_by_beat, persona_by_artifact)
+    )
+    multi_beat_scenes, held_beats = _hold_scene_followers(
+        client, scenes, clips_by_beat
+    )
     return {
         "scenes": len(scenes),
         "multi_beat_scenes": multi_beat_scenes,
@@ -1369,7 +1392,7 @@ def point_clips_to_own_beat_image(client: Client, run_id: str) -> dict:
         client.table("timeline").select("id").eq("run_id", run_id).limit(1).execute().data
     ) or []
     if not timeline:
-        return {"repointed": 0, "skipped": "no timeline"}
+        return {"repointed": 0, "skipped": _NO_TIMELINE}
     timeline_id = timeline[0]["id"]
 
     video_tracks = (
@@ -1381,7 +1404,7 @@ def point_clips_to_own_beat_image(client: Client, run_id: str) -> dict:
         .data
     ) or []
     if not video_tracks:
-        return {"repointed": 0, "skipped": "no video track"}
+        return {"repointed": 0, "skipped": _NO_VIDEO_TRACK}
     video_track_ids = [t["id"] for t in video_tracks]
 
     # Each beat's distinct rendered image = its visual slot's current artifact.
@@ -1390,7 +1413,7 @@ def point_clips_to_own_beat_image(client: Client, run_id: str) -> dict:
         .select("beat_index, current_artifact_id")
         .eq("run_id", run_id)
         .eq("track", "visual")
-        .filter("current_artifact_id", "not.is", "null")
+        .filter("current_artifact_id", _NOT_IS, "null")
         .execute()
         .data
     ) or []
@@ -1423,7 +1446,7 @@ def point_clips_to_own_beat_image(client: Client, run_id: str) -> dict:
         if clip.get("artifact_id") == own_image:
             continue
         client.table("clip").update(
-            {"artifact_id": own_image, "updated_at": "now()"}
+            {"artifact_id": own_image, "updated_at": _DATABASE_NOW}
         ).eq("id", clip["id"]).execute()
         repointed += 1
 
@@ -1526,30 +1549,90 @@ def _plan_subshots(
     return pieces
 
 
+def _planned_clip_subshots(
+    clip: dict,
+) -> tuple[int, dict[str, Any], list[dict[str, Any]]] | None:
+    beat = clip.get("beat_index")
+    if beat is None:
+        return None
+    attributes = dict(clip.get("attributes") or {})
+    if attributes.get("subshot_count"):
+        return None
+    scene_type = str(attributes.get("scene_type") or "").lower()
+    render_mode = str(attributes.get("render_mode") or "").lower()
+    product = scene_type in ("product", "proof") or render_mode == "social_proof"
+    pieces = _plan_subshots(
+        int(clip.get("start_ms") or 0),
+        int(clip.get("duration_ms") or 0),
+        product=product,
+    )
+    if not pieces:
+        return None
+    return int(beat), attributes, pieces
+
+
+def _subshot_attributes(
+    attributes: dict[str, Any],
+    piece: dict[str, Any],
+    count: int,
+    beat: int,
+) -> dict[str, Any]:
+    return {
+        **attributes,
+        "subshot_count": count,
+        "subshot_index": piece["index"],
+        "subshot_shot_size": piece["shot_size"],
+        "subshot_of_beat": beat,
+    }
+
+
+def _materialize_subshots(
+    client: Client,
+    clip: dict,
+    beat: int,
+    attributes: dict[str, Any],
+    pieces: list[dict[str, Any]],
+) -> int:
+    first = pieces[0]
+    client.table("clip").update(
+        {
+            "duration_ms": first["duration_ms"],
+            "transforms": first["transforms"],
+            "attributes": _subshot_attributes(
+                attributes, first, len(pieces), beat
+            ),
+            "updated_at": _DATABASE_NOW,
+        }
+    ).eq("id", clip["id"]).execute()
+    for piece in pieces[1:]:
+        client.table("clip").insert(
+            {
+                "track_id": clip["track_id"],
+                "artifact_id": clip.get("artifact_id"),
+                "start_ms": piece["start_ms"],
+                "duration_ms": piece["duration_ms"],
+                "in_ms": clip.get("in_ms") or 0,
+                "out_ms": clip.get("out_ms"),
+                "transforms": piece["transforms"],
+                "effects": clip.get("effects") or [],
+                "keyframes": clip.get("keyframes") or [],
+                "text_content": clip.get("text_content"),
+                "beat_index": None,
+                "attributes": _subshot_attributes(
+                    attributes, piece, len(pieces), beat
+                ),
+            }
+        ).execute()
+    return len(pieces) - 1
+
+
 def split_long_beats_into_subshots(client: Client, run_id: str) -> dict:
-    """B-SHOT2: give long beats SV26 cut rhythm by splitting each long video clip
-    into a sequence of reframed sub-shots on the same track.
-
-    Runs at compose time, AFTER :func:`point_clips_to_own_beat_image` (so every
-    beat first holds its own distinct image) and AFTER the audio repack (so clip
-    start/duration are already voice-aligned). For every video clip longer than
-    ``_SUBSHOT_MIN_SPLIT_MS`` it:
-
-      * shrinks the existing clip to the FIRST sub-shot window and stamps its
-        wide framing, then
-      * INSERTS the remaining sub-shots (same artifact, tighter framings, and
-        beat_index=NULL — a UNIQUE (track_id, beat_index) constraint means only
-        ONE clip per beat may own the index) so the video lane cuts every ~2–3s.
-
-    Idempotent: the base clip is stamped with ``attributes.subshot_count`` once
-    split, and follower sub-shots (``subshot_index >= 1``) carry no beat_index, so
-    re-composing skips both and never double-splits.
-    """
+    """Split long video beats into deterministic, idempotent reframed cuts."""
     timeline = (
         client.table("timeline").select("id").eq("run_id", run_id).limit(1).execute().data
     ) or []
     if not timeline:
-        return {"split_beats": 0, "skipped": "no timeline"}
+        return {"split_beats": 0, "skipped": _NO_TIMELINE}
     timeline_id = timeline[0]["id"]
 
     video_tracks = (
@@ -1561,7 +1644,7 @@ def split_long_beats_into_subshots(client: Client, run_id: str) -> dict:
         .data
     ) or []
     if not video_tracks:
-        return {"split_beats": 0, "skipped": "no video track"}
+        return {"split_beats": 0, "skipped": _NO_VIDEO_TRACK}
     video_track_ids = [t["id"] for t in video_tracks]
 
     clips = (
@@ -1579,65 +1662,14 @@ def split_long_beats_into_subshots(client: Client, run_id: str) -> dict:
     split_beats = 0
     inserted = 0
     for clip in clips:
-        beat = clip.get("beat_index")
-        if beat is None:
-            continue  # a follower sub-shot from a previous split → skip
-        attrs = dict(clip.get("attributes") or {})
-        if attrs.get("subshot_count"):
-            continue  # this base clip was already split → idempotent skip
-        duration_ms = int(clip.get("duration_ms") or 0)
-        scene_type = str(attrs.get("scene_type") or "").lower()
-        render_mode = str(attrs.get("render_mode") or "").lower()
-        product = scene_type in ("product", "proof") or render_mode == "social_proof"
-        pieces = _plan_subshots(
-            int(clip.get("start_ms") or 0), duration_ms, product=product
-        )
-        if not pieces:
+        planned = _planned_clip_subshots(clip)
+        if not planned:
             continue
-
-        first = pieces[0]
-        client.table("clip").update({
-            "duration_ms": first["duration_ms"],
-            "transforms": first["transforms"],
-            "attributes": {
-                **attrs,
-                "subshot_count": len(pieces),
-                "subshot_index": 0,
-                "subshot_shot_size": first["shot_size"],
-                "subshot_of_beat": int(beat),
-            },
-            "updated_at": "now()",
-        }).eq("id", clip["id"]).execute()
-
-        for piece in pieces[1:]:
-            client.table("clip").insert({
-                "track_id": clip["track_id"],
-                "artifact_id": clip.get("artifact_id"),
-                "start_ms": piece["start_ms"],
-                "duration_ms": piece["duration_ms"],
-                "in_ms": clip.get("in_ms") or 0,
-                "out_ms": clip.get("out_ms"),
-                "transforms": piece["transforms"],
-                "effects": clip.get("effects") or [],
-                "keyframes": clip.get("keyframes") or [],
-                "text_content": clip.get("text_content"),
-                # Follower sub-shots carry NO beat_index: there is a UNIQUE
-                # (track_id, beat_index) constraint, and only one clip per beat may
-                # own it. The renderer drops beat_index at render time anyway and
-                # derives scene_type from attributes, so a null-beat sub-shot
-                # renders identically. ``subshot_of_beat`` keeps the lineage.
-                "beat_index": None,
-                "attributes": {
-                    **attrs,
-                    "subshot_count": len(pieces),
-                    "subshot_index": piece["index"],
-                    "subshot_shot_size": piece["shot_size"],
-                    "subshot_of_beat": int(beat),
-                },
-            }).execute()
-            inserted += 1
+        beat, attributes, pieces = planned
+        inserted += _materialize_subshots(
+            client, clip, beat, attributes, pieces
+        )
         split_beats += 1
-
     return {
         "split_beats": split_beats,
         "inserted_subshots": inserted,
