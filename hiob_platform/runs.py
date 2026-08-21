@@ -298,32 +298,48 @@ def _music_result_is_success(out: dict[str, Any]) -> bool:
     return not any(key in out for key in failure_keys)
 
 
-def media_worker_result_is_success(out: Any, *, kind: str = "") -> bool:
-    """Return true only when a media worker proves work or clean reuse."""
+def _media_worker_has_failure(out: Any) -> bool:
     if not isinstance(out, dict) or out.get("error"):
-        return False
+        return True
     skip_reason = out.get("skip_reason")
     if isinstance(skip_reason, str) and skip_reason.strip():
-        return False
+        return True
     if out.get("status") in {"empty_pool", "no_candidates"}:
-        return False
-    if _is_skip_reason_soft_fail(out.get("skipped")):
-        return False
-    if _failed_batch_without_output(out):
-        return False
+        return True
+    return _is_skip_reason_soft_fail(out.get("skipped")) or _failed_batch_without_output(out)
 
-    kind_l = (kind or "").lower()
-    if kind_l == "visual" or "visuals" in out or "reused" in out:
-        return _visual_result_is_success(out)
-    if kind_l == "voiceover" or "voiceovers" in out:
-        return _voice_result_is_success(out)
-    if kind_l == "sfx" or (
+
+def _media_result_kind(out: dict[str, Any], kind: str) -> str:
+    normalized = (kind or "").lower()
+    if normalized == "visual" or "visuals" in out or "reused" in out:
+        return "visual"
+    if normalized == "voiceover" or "voiceovers" in out:
+        return "voiceover"
+    if normalized == "sfx" or (
         "created" in out and ("failed" in out or "details" in out)
     ):
-        return _sfx_result_is_success(out)
-    if kind_l == "music":
-        return _music_result_is_success(out)
-    return True
+        return "sfx"
+    if normalized == "music":
+        return "music"
+    return ""
+
+
+def _typed_media_result_is_success(out: dict[str, Any], kind: str) -> bool:
+    handlers = {
+        "visual": _visual_result_is_success,
+        "voiceover": _voice_result_is_success,
+        "sfx": _sfx_result_is_success,
+        "music": _music_result_is_success,
+    }
+    handler = handlers.get(kind)
+    return handler(out) if handler else True
+
+
+def media_worker_result_is_success(out: Any, *, kind: str = "") -> bool:
+    """Return true only when a media worker proves work or clean reuse."""
+    if _media_worker_has_failure(out):
+        return False
+    return _typed_media_result_is_success(out, _media_result_kind(out, kind))
 
 
 def media_job_row_is_clean_success(row: dict[str, Any] | None) -> bool:
