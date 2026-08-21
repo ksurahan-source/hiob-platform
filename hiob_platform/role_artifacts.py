@@ -609,32 +609,64 @@ def materialize_role_outputs(
     return artifacts
 
 
+def _expected_artifact(item: Any) -> dict | None:
+    if not isinstance(item, dict):
+        return None
+    role = str(item.get("role") or "").strip()
+    category = str(item.get("category") or "").strip()
+    if not role and not category:
+        return None
+    try:
+        count = int(item["count"]) if item.get("count") is not None else 1
+    except (TypeError, ValueError):
+        count = 1
+    return {
+        "role": role or None,
+        "category": category or None,
+        "count": max(1, count),
+    }
+
+
 def expected_artifacts_from_team_leader(team_leader_output: dict | None) -> list[dict]:
-    """Normalize the team leader's expected_artifacts list to a comparable shape."""
-    if not team_leader_output:
-        return []
-    raw = team_leader_output.get("expected_artifacts")
+    """Normalize the team leader's expected artifact declaration."""
+    raw = team_leader_output.get("expected_artifacts") if team_leader_output else None
     if not isinstance(raw, list):
         return []
-    out: list[dict] = []
-    for item in raw:
-        if not isinstance(item, dict):
-            continue
-        role = str(item.get("role") or "").strip()
-        category = str(item.get("category") or "").strip()
-        count = item.get("count")
-        try:
-            count_int = int(count) if count is not None else 1
-        except (TypeError, ValueError):
-            count_int = 1
-        if not role and not category:
-            continue
-        out.append({
-            "role": role or None,
-            "category": category or None,
-            "count": max(1, count_int),
-        })
-    return out
+    return [
+        artifact
+        for item in raw
+        if (artifact := _expected_artifact(item)) is not None
+    ]
+
+
+def _actual_artifact_counts(
+    actual_artifacts: Iterable[dict],
+) -> tuple[dict[str, int], dict[str, int]]:
+    by_role: dict[str, int] = {}
+    by_category: dict[str, int] = {}
+    for artifact in actual_artifacts:
+        attributes = artifact.get("attributes") or {}
+        role = artifact.get("role_code") or attributes.get("role_code")
+        category = artifact.get("category") or attributes.get("category")
+        if role:
+            by_role[role] = by_role.get(role, 0) + 1
+        if category:
+            by_category[category] = by_category.get(category, 0) + 1
+    return by_role, by_category
+
+
+def _artifact_gap(
+    expected: dict,
+    actuals_by_role: dict[str, int],
+    actuals_by_category: dict[str, int],
+) -> dict | None:
+    have = 0
+    if expected.get("role"):
+        have = max(have, actuals_by_role.get(expected["role"], 0))
+    if expected.get("category"):
+        have = max(have, actuals_by_category.get(expected["category"], 0))
+    want = expected["count"]
+    return {**expected, "have": have, "missing": want - have} if have < want else None
 
 
 def diff_expected_vs_actual(
@@ -642,23 +674,9 @@ def diff_expected_vs_actual(
     actual_artifacts: Iterable[dict],
 ) -> list[dict]:
     """Return the list of expected entries that are short of `count`."""
-    actuals_by_role: dict[str, int] = {}
-    actuals_by_category: dict[str, int] = {}
-    for art in actual_artifacts:
-        role = art.get("role_code") or (art.get("attributes") or {}).get("role_code")
-        cat = art.get("category") or (art.get("attributes") or {}).get("category")
-        if role:
-            actuals_by_role[role] = actuals_by_role.get(role, 0) + 1
-        if cat:
-            actuals_by_category[cat] = actuals_by_category.get(cat, 0) + 1
-    gaps: list[dict] = []
-    for exp in expected:
-        want = exp["count"]
-        have = 0
-        if exp.get("role"):
-            have = max(have, actuals_by_role.get(exp["role"], 0))
-        if exp.get("category"):
-            have = max(have, actuals_by_category.get(exp["category"], 0))
-        if have < want:
-            gaps.append({**exp, "have": have, "missing": want - have})
-    return gaps
+    by_role, by_category = _actual_artifact_counts(actual_artifacts)
+    return [
+        gap
+        for item in expected
+        if (gap := _artifact_gap(item, by_role, by_category)) is not None
+    ]

@@ -31,27 +31,34 @@ def unknown_ascii_terms(text: str) -> list[str]:
     return sorted({m.group(0) for m in ASCII_TOKEN_RE.finditer(text or "")})
 
 
+def _raw_override_pairs(overrides: Any) -> list[tuple[Any, Any]]:
+    if isinstance(overrides, dict):
+        return list(overrides.items())
+    if not isinstance(overrides, list):
+        return []
+    return [
+        (
+            item.get("source") or item.get("from") or item.get("term"),
+            item.get("replacement") or item.get("to") or item.get("pronunciation"),
+        )
+        for item in overrides
+        if isinstance(item, dict)
+    ]
+
+
+def _normalized_override_pair(source: Any, replacement: Any) -> tuple[str, str] | None:
+    pair = (str(source or "").strip(), str(replacement or "").strip())
+    return pair if all(pair) else None
+
+
 def _override_pairs(overrides: Any) -> list[tuple[str, str]]:
     if not overrides:
         return []
-    if isinstance(overrides, dict):
-        raw_pairs = overrides.items()
-    elif isinstance(overrides, list):
-        raw_pairs = []
-        for item in overrides:
-            if isinstance(item, dict):
-                source = item.get("source") or item.get("from") or item.get("term")
-                replacement = item.get("replacement") or item.get("to") or item.get("pronunciation")
-                raw_pairs.append((source, replacement))
-    else:
-        return []
-
-    pairs: list[tuple[str, str]] = []
-    for source, replacement in raw_pairs:
-        src = str(source or "").strip()
-        dst = str(replacement or "").strip()
-        if src and dst:
-            pairs.append((src, dst))
+    pairs = [
+        pair
+        for source, replacement in _raw_override_pairs(overrides)
+        if (pair := _normalized_override_pair(source, replacement)) is not None
+    ]
     pairs.sort(key=lambda pair: len(pair[0]), reverse=True)
     return pairs
 
@@ -145,15 +152,19 @@ _N_VAL = {"한": 1, "두": 2, "세": 3, "네": 4, "다섯": 5, "여섯": 6, "일
           "열": 10, "스무": 20, "스물": 20}
 
 
-def _parse_hangul_number(tok: str) -> int | None:
-    if tok in _N_VAL:
-        return _N_VAL[tok]
-    if tok.startswith("스물") or tok.startswith("열"):
-        base = 20 if tok.startswith("스물") else 10
-        rest = tok[2:] if tok.startswith("스물") else tok[1:]
-        return base + (_N_VAL.get(rest, 0) if rest else 0)
+def _compound_native_number(token: str) -> int | None:
+    if token.startswith("스물"):
+        rest = token[2:]
+        return 20 + (_N_VAL.get(rest, 0) if rest else 0)
+    if token.startswith("열"):
+        rest = token[1:]
+        return 10 + (_N_VAL.get(rest, 0) if rest else 0)
+    return None
+
+
+def _parse_sino_number(token: str) -> int | None:
     total, cur = 0, 0
-    for ch in tok:
+    for ch in token:
         if ch in _S_VAL:
             cur = _S_VAL[ch]
         elif ch in _S_MUL:
@@ -162,6 +173,13 @@ def _parse_hangul_number(tok: str) -> int | None:
         else:
             return None
     return total + cur if (total or cur) else None
+
+
+def _parse_hangul_number(tok: str) -> int | None:
+    if tok in _N_VAL:
+        return _N_VAL[tok]
+    compound = _compound_native_number(tok)
+    return compound if compound is not None else _parse_sino_number(tok)
 
 
 def caption_numerals_to_digits(text: str) -> str:

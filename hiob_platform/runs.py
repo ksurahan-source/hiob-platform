@@ -10,6 +10,7 @@ APPROVED_SCRIPT_STATUSES = frozenset({"approved", "queued", "produced"})
 REQUIRED_PRODUCTION_WORK_KINDS = frozenset({"visual", "voiceover", "music", "sfx"})
 OPTIONAL_PRODUCTION_WORK_KINDS = frozenset({"caption", "title_style"})
 PRODUCTION_WORK_KINDS = REQUIRED_PRODUCTION_WORK_KINDS | OPTIONAL_PRODUCTION_WORK_KINDS
+_DATABASE_NOW = "now()"
 
 # SEC-C2: mirror Studio lib/editorGate.js env contract.
 _GATE_OFF = frozenset({"0", "false", "off", "no"})
@@ -121,12 +122,12 @@ def update_production_job(
         return {}
     payload: dict[str, Any] = {
         "status": status,
-        "updated_at": "now()",
+        "updated_at": _DATABASE_NOW,
     }
     if status == "running":
-        payload["started_at"] = "now()"
+        payload["started_at"] = _DATABASE_NOW
     if status in {"succeeded", "failed", "cancelled", "skipped"}:
-        payload["ended_at"] = "now()"
+        payload["ended_at"] = _DATABASE_NOW
     if span_id is not None:
         payload["span_id"] = span_id
     if modal_call_id is not None:
@@ -175,7 +176,7 @@ def render_job_patch_after_compose(
         patch: dict[str, Any] = {
             "status": "done",
             "output_url": url,
-            "completed_at": "now()",
+            "completed_at": _DATABASE_NOW,
         }
         if duration_s is not None:
             patch["duration_s"] = duration_s
@@ -212,14 +213,14 @@ def _is_skip_reason_soft_fail(skipped: Any) -> bool:
     """
     if skipped is None or skipped is False:
         return False
+    if skipped is True:
+        return True
     if isinstance(skipped, str):
         return bool(skipped.strip())
     if isinstance(skipped, (int, float)):
         return False
     if isinstance(skipped, (list, tuple)):
         return False
-    if skipped is True:
-        return True
     return False
 
 
@@ -243,25 +244,64 @@ def is_visual_worker_success(out: Any) -> bool:
     return True
 
 
+def _first_work_count(out: dict[str, Any]) -> Any:
+    for key in ("created", "voiceovers", "visuals"):
+        if out.get(key) is not None:
+            return out[key]
+    return 0
+
+
+def _failed_batch_without_output(out: dict[str, Any]) -> bool:
+    failed = out.get("failed")
+    return bool(isinstance(failed, list) and failed) and _as_nonneg_int(
+        _first_work_count(out)
+    ) <= 0
+
+
+def _visual_result_is_success(out: dict[str, Any]) -> bool:
+    if "visuals" not in out and "reused" not in out:
+        return True
+    return is_visual_worker_success(out)
+
+
+def _voice_result_is_success(out: dict[str, Any]) -> bool:
+    skipped = out.get("skipped")
+    has_batch_keys = (
+        "voiceovers" in out
+        or isinstance(skipped, (int, float, list, tuple))
+        or "failed" in out
+    )
+    if not has_batch_keys:
+        return True
+    skipped_n = len(skipped) if isinstance(skipped, (list, tuple)) else _as_nonneg_int(skipped)
+    return (_as_nonneg_int(out.get("voiceovers")) + skipped_n) > 0
+
+
+def _sfx_result_is_success(out: dict[str, Any]) -> bool:
+    if not any(key in out for key in ("created", "failed", "skipped", "details")):
+        return True
+    if _as_nonneg_int(out.get("created")) > 0:
+        return True
+    failed = out.get("failed")
+    if isinstance(failed, list) and failed:
+        return False
+    skipped = out.get("skipped")
+    return bool(isinstance(skipped, (list, tuple)) and skipped)
+
+
+def _music_result_is_success(out: dict[str, Any]) -> bool:
+    if out.get("music") == "already_present" or out.get("artifact_id"):
+        return True
+    if out.get("ok") is True:
+        return True
+    failure_keys = ("skipped", "skip_reason", "status", "error", "created")
+    return not any(key in out for key in failure_keys)
+
+
 def media_worker_result_is_success(out: Any, *, kind: str = "") -> bool:
-    """Predicate for media worker return dicts (voice/music/sfx/visual).
-
-    Soft-fail shapes that must NOT mark production_jobs succeeded:
-    - ``{"error": ...}``
-    - ``{"skipped": "<reason>"}`` string reasons (empty music pool, no_cues, ...)
-    - ``{"failed": [...], "created": 0}`` total SFX/visual batch miss
-    - visual-specific: zero visuals+reused / error (via is_visual_worker_success)
-
-    Already-present batch counts/lists are NOT soft-fail:
-    - voiceover ``skipped: 3`` (beats already current)
-    - visual ``skipped: 1`` / ``reused: 4``
-    - sfx ``skipped: [{reason: already_present}, ...]`` with created>=0
-    """
-    if not isinstance(out, dict):
+    """Return true only when a media worker proves work or clean reuse."""
+    if not isinstance(out, dict) or out.get("error"):
         return False
-    if out.get("error"):
-        return False
-    # Music also surfaces skip_reason / status without always setting skipped.
     skip_reason = out.get("skip_reason")
     if isinstance(skip_reason, str) and skip_reason.strip():
         return False
@@ -269,69 +309,20 @@ def media_worker_result_is_success(out: Any, *, kind: str = "") -> bool:
         return False
     if _is_skip_reason_soft_fail(out.get("skipped")):
         return False
-
-    failed = out.get("failed")
-    if isinstance(failed, list) and len(failed) > 0:
-        created = _as_nonneg_int(
-            out.get("created")
-            if out.get("created") is not None
-            else (out.get("voiceovers") if out.get("voiceovers") is not None else out.get("visuals"))
-        )
-        if created <= 0:
-            return False
+    if _failed_batch_without_output(out):
+        return False
 
     kind_l = (kind or "").lower()
     if kind_l == "visual" or "visuals" in out or "reused" in out:
-        # Empty attrs on a succeeded job row = legacy clean (no worker payload stored).
-        if "visuals" not in out and "reused" not in out:
-            return True
-        return is_visual_worker_success(out)
-
+        return _visual_result_is_success(out)
     if kind_l == "voiceover" or "voiceovers" in out:
-        has_batch_keys = (
-            "voiceovers" in out
-            or isinstance(out.get("skipped"), (int, float, list, tuple))
-            or "failed" in out
-        )
-        if not has_batch_keys:
-            return True  # legacy empty attributes on clean succeeded job
-        voiceovers = _as_nonneg_int(out.get("voiceovers"))
-        skipped = out.get("skipped")
-        if isinstance(skipped, (list, tuple)):
-            skipped_n = len(skipped)
-        else:
-            skipped_n = _as_nonneg_int(skipped)
-        # Zero work and zero already-present = silent empty success — fail-loud.
-        return (voiceovers + skipped_n) > 0
-
+        return _voice_result_is_success(out)
     if kind_l == "sfx" or (
         "created" in out and ("failed" in out or "details" in out)
     ):
-        has_batch_keys = any(k in out for k in ("created", "failed", "skipped", "details"))
-        if not has_batch_keys:
-            return True  # legacy empty attributes
-        created = _as_nonneg_int(out.get("created"))
-        if created > 0:
-            return True
-        if isinstance(failed, list) and len(failed) > 0:
-            return False
-        skipped = out.get("skipped")
-        # All cues already_present → sfx is on the timeline; clean success.
-        if isinstance(skipped, (list, tuple)) and len(skipped) > 0:
-            return True
-        # created=0, no skips, no fails — empty batch (should have used skip reason).
-        return False
-
+        return _sfx_result_is_success(out)
     if kind_l == "music":
-        if out.get("music") == "already_present" or out.get("artifact_id"):
-            return True
-        if out.get("ok") is True:
-            return True
-        # Opaque/empty success payload without skip signals = clean (legacy attrs {}).
-        if not any(k in out for k in ("skipped", "skip_reason", "status", "error", "created")):
-            return True
-        return False
-
+        return _music_result_is_success(out)
     return True
 
 
@@ -386,7 +377,7 @@ def mark_run_media_failed(client: Client, run_id: str, *, reason: str) -> dict:
     payload: dict[str, Any] = {
         "status": "failed",
         "script_status": "failed",
-        "ended_at": "now()",
+        "ended_at": _DATABASE_NOW,
     }
     res = client.table("run").update(payload).eq("id", run_id).execute()
     set_run_attr(client, run_id, "produce_error", reason_s)
@@ -471,7 +462,7 @@ def maybe_mark_run_produced(client: Client, run_id: str) -> dict:
 
 
 def end_run(client: Client, run_id: str, status: str = "succeeded", **fields: Any) -> dict:
-    payload = {"status": status, "ended_at": "now()", **fields}
+    payload = {"status": status, "ended_at": _DATABASE_NOW, **fields}
     res = client.table("run").update(payload).eq("id", run_id).execute()
     return res.data[0] if res.data else {}
 
@@ -516,11 +507,22 @@ def end_span(
     error: dict | None = None,
     attributes_patch: dict | None = None,
 ) -> dict:
-    payload: dict[str, Any] = {"status": status, "ended_at": "now()"}
+    payload: dict[str, Any] = {"status": status, "ended_at": _DATABASE_NOW}
     if output_preview is not None:
         payload["output_preview"] = output_preview
     if error is not None:
         payload["error"] = error
+    if attributes_patch is not None:
+        rows = (
+            client.table("span")
+            .select("attributes")
+            .eq("id", span_id)
+            .limit(1)
+            .execute()
+            .data
+        )
+        current = dict(rows[0].get("attributes") or {}) if rows else {}
+        payload["attributes"] = {**current, **attributes_patch}
     res = client.table("span").update(payload).eq("id", span_id).execute()
     return res.data[0] if res.data else {}
 

@@ -171,73 +171,90 @@ def resolve_pool_asset_sha256(client: Client, asset: dict[str, Any]) -> str:
     return sha
 
 
-def register_asset_library_item(
+def _generated_reuse_policy(
+    *,
+    kind: str,
+    source: str,
+    tags: list[str],
+    attributes: dict[str, Any],
+    reuse_scope: str,
+) -> tuple[list[str], dict[str, Any], str]:
+    source_norm = str(source or attributes.get("source") or "").strip().lower()
+    generated = kind in {"image", "video"} and (
+        source_norm in {"ai", "generated", "synthetic"}
+        or bool(attributes.get("generated"))
+        or "source:ai" in tags
+        or "generated:true" in tags
+    )
+    if not generated:
+        return tags, attributes, reuse_scope
+    if reuse_scope == "public":
+        reuse_scope = "project"
+    tags = [tag for tag in tags if tag != "scope:global"]
+    attributes["image_reuse_policy"] = (
+        attributes.get("image_reuse_policy") or "no_global_reuse"
+    )
+    if attributes.get("scope") == "global":
+        attributes["scope"] = "project"
+    return tags, attributes, reuse_scope
+
+
+def _tag_value(tags: list[str], prefix: str) -> str | None:
+    return next(
+        (tag.split(":", 1)[1] for tag in tags if tag.startswith(prefix)),
+        None,
+    )
+
+
+def _apply_asset_validation(
     client: Client,
+    artifact: dict,
+    kind: str,
+    role_code: str | None,
+    tags: list[str],
+    attributes: dict[str, Any],
+) -> None:
+    role = role_code or _tag_value(tags, "role:")
+    brand = _tag_value(tags, "brand:")
+    siblings = None
+    if (role or "").lower().replace("_", "-") == "social-proof":
+        siblings = _brand_sibling_sha256s(client, brand)
+    verdict = validate_brand_asset(
+        role=role,
+        kind=kind,
+        bytes_size=artifact.get("bytes"),
+        duration_ms=artifact.get("duration_ms"),
+        sha256=artifact.get("sha256"),
+        sibling_asset_sha256s=siblings,
+    )
+    if verdict["ok"]:
+        return
+    attributes.update(
+        {
+            "needs_human": True,
+            "needs_human_reason": verdict["reason"],
+            "needs_human_code": verdict["code"],
+        }
+    )
+
+
+def _asset_library_payload(
     *,
     run_id: str | None,
     artifact: dict,
     kind: str,
-    source: str = "ai",
-    provider: str | None = None,
-    provider_model: str | None = None,
-    title: str | None = None,
-    preview_text: str | None = None,
-    license: str | None = None,
-    reuse_scope: str = "workspace",
-    tags: list[str] | None = None,
-    attributes: dict[str, Any] | None = None,
-    category: str | None = None,
-    role_code: str | None = None,
-) -> dict | None:
-    """Best-effort registration in the reusable asset library.
-
-    The artifact row remains canonical for timeline clips. The library row is
-    the cross-run reuse surface; if the migration is not applied yet, artifact
-    creation must still succeed.
-
-    ``category`` / ``role_code`` populate the napkin data-model columns so the
-    asset bin/picker can filter by ``category`` (logo/product_image/social_proof/
-    music/sfx/voice…). They are written only when provided, keeping older callers
-    and pre-migration databases unaffected.
-    """
-    # Canonicalize brand/product tags at intake so a KO display name never forks
-    # the brand (napkin DATA MODEL; D4). e.g. brand:뷰오케이 → brand:viewok.
-    canon_tags = canonicalize_brand_tags(tags)
-    attrs = dict(attributes or {})
-    source_norm = str(source or attrs.get("source") or "").strip().lower()
-    generated_image_or_video = (
-        kind in {"image", "video"}
-        and (
-            source_norm in {"ai", "generated", "synthetic"}
-            or bool(attrs.get("generated"))
-            or "source:ai" in canon_tags
-            or "generated:true" in canon_tags
-        )
-    )
-    if generated_image_or_video:
-        if reuse_scope == "public":
-            reuse_scope = "project"
-        canon_tags = [t for t in canon_tags if t != "scope:global"]
-        attrs["image_reuse_policy"] = attrs.get("image_reuse_policy") or "no_global_reuse"
-        if attrs.get("scope") == "global":
-            attrs["scope"] = "project"
-    # D5 (napkin REAL ASSETS): flag a degenerate brand upload for human review.
-    _role = role_code or next((t.split(":", 1)[1] for t in canon_tags if t.startswith("role:")), None)
-    _brand = next((t.split(":", 1)[1] for t in canon_tags if t.startswith("brand:")), None)
-    _siblings = (
-        _brand_sibling_sha256s(client, _brand)
-        if (_role or "").lower().replace("_", "-") == "social-proof"
-        else None
-    )
-    _verdict = validate_brand_asset(
-        role=_role, kind=kind, bytes_size=artifact.get("bytes"),
-        duration_ms=artifact.get("duration_ms"), sha256=artifact.get("sha256"),
-        sibling_asset_sha256s=_siblings,
-    )
-    if not _verdict["ok"]:
-        attrs["needs_human"] = True
-        attrs["needs_human_reason"] = _verdict["reason"]
-        attrs["needs_human_code"] = _verdict["code"]
+    source: str,
+    provider: str | None,
+    provider_model: str | None,
+    title: str | None,
+    preview_text: str | None,
+    license: str | None,
+    reuse_scope: str,
+    tags: list[str],
+    attributes: dict[str, Any],
+    category: str | None,
+    role_code: str | None,
+) -> dict[str, Any]:
     payload = {
         "run_id": run_id,
         "artifact_id": artifact.get("id"),
@@ -256,17 +273,65 @@ def register_asset_library_item(
         "height": artifact.get("height"),
         "preview_text": preview_text or artifact.get("preview_text"),
         "thumbnail_key": artifact.get("thumbnail_key"),
-        "tags": canon_tags,
+        "tags": tags,
         "license": license,
         "reuse_scope": reuse_scope,
-        "attributes": attrs,
+        "attributes": attributes,
     }
-    # Napkin data-model columns — only set when provided so existing callers and
-    # pre-0007 databases (no category/role_code columns) keep working unchanged.
     if category is not None:
         payload["category"] = category
     if role_code is not None:
         payload["role_code"] = role_code
+    return payload
+
+
+def register_asset_library_item(
+    client: Client,
+    *,
+    run_id: str | None,
+    artifact: dict,
+    kind: str,
+    source: str = "ai",
+    provider: str | None = None,
+    provider_model: str | None = None,
+    title: str | None = None,
+    preview_text: str | None = None,
+    license: str | None = None,
+    reuse_scope: str = "workspace",
+    tags: list[str] | None = None,
+    attributes: dict[str, Any] | None = None,
+    category: str | None = None,
+    role_code: str | None = None,
+) -> dict | None:
+    """Best-effort registration in the reusable asset library."""
+    canon_tags = canonicalize_brand_tags(tags)
+    attrs = dict(attributes or {})
+    canon_tags, attrs, reuse_scope = _generated_reuse_policy(
+        kind=kind,
+        source=source,
+        tags=canon_tags,
+        attributes=attrs,
+        reuse_scope=reuse_scope,
+    )
+    _apply_asset_validation(
+        client, artifact, kind, role_code, canon_tags, attrs
+    )
+    payload = _asset_library_payload(
+        run_id=run_id,
+        artifact=artifact,
+        kind=kind,
+        source=source,
+        provider=provider,
+        provider_model=provider_model,
+        title=title,
+        preview_text=preview_text,
+        license=license,
+        reuse_scope=reuse_scope,
+        tags=canon_tags,
+        attributes=attrs,
+        category=category,
+        role_code=role_code,
+    )
     try:
         res = client.table("asset_library_item").upsert(
             payload,

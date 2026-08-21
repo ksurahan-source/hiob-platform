@@ -7,11 +7,7 @@ from functools import lru_cache
 from typing import Optional, TypedDict
 import os
 
-try:
-    import httpx
-    _HTTPX_AVAILABLE = True
-except ImportError:
-    _HTTPX_AVAILABLE = False
+import httpx
 
 
 class BrandKit(TypedDict):
@@ -35,9 +31,6 @@ def get_brand_kit(brand_slug: str) -> Optional[BrandKit]:
     Fetch the latest active brand kit for a brand. Cached in-process (32 kits).
     Returns None on any error — callers must use hardcoded fallbacks.
     """
-    if not _HTTPX_AVAILABLE:
-        return None
-
     studio_url = os.getenv('STUDIO_URL', 'https://studio.hi-ob.com')
     secret_key = os.getenv('SUPABASE_SECRET_KEY')
     if not secret_key:
